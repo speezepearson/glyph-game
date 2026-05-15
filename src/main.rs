@@ -27,25 +27,9 @@ const SLIDER_MARGIN: f32 = 20.0;
 /// What the user is currently doing with the mouse.
 enum Drag {
     /// Drawing a brand-new segment; we own its growing displacement.
-    /// `glyph` is `None` because new segments don't belong to a glyph
-    /// until released (and possibly merged).
     DrawNew { start: TorusPoint, disp: TorusVec },
-    /// Modifying segment `seg_idx` inside `glyph_idx`. Dragging doesn't
-    /// change glyph membership (per design), but it does change the
-    /// underlying segments so the affected glyph's DCEL is rebuilt on
-    /// every frame the drag advances.
-    Modify {
-        glyph_idx: usize,
-        seg_idx: usize,
-        kind: ModifyKind,
-    },
-}
-
-#[derive(Copy, Clone)]
-enum ModifyKind {
-    Start,
-    End,
-    Whole,
+    /// Translating an entire glyph by the cumulative mouse delta.
+    MoveGlyph { glyph_idx: usize },
 }
 
 struct App {
@@ -53,6 +37,10 @@ struct App {
     drag: Option<Drag>,
     hit_radius_px: f32,
     slider_drag: bool,
+    /// Past states, most recent on top. `undo` pops one and restores it.
+    undo_stack: Vec<Vec<TorusSegment>>,
+    /// States that were undone and can be re-applied.
+    redo_stack: Vec<Vec<TorusSegment>>,
 }
 
 impl App {
@@ -62,6 +50,50 @@ impl App {
             drag: None,
             hit_radius_px: HIT_RADIUS_DEFAULT_PX,
             slider_drag: false,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+        }
+    }
+
+    /// Flatten every glyph's segments into one list. The grouping into
+    /// glyphs is recovered from this list on `restore` by reconnecting
+    /// touching segments.
+    fn snapshot(&self) -> Vec<TorusSegment> {
+        self.glyphs
+            .iter()
+            .flat_map(|g| g.segments.iter().copied())
+            .collect()
+    }
+
+    /// Replace the current glyphs with whatever the given flat segment
+    /// list implies, after partitioning into connected components.
+    fn restore(&mut self, segments: Vec<TorusSegment>) {
+        self.glyphs = glyph::partition_into_glyphs(segments)
+            .into_iter()
+            .map(Glyph::from_chopped_segments)
+            .collect();
+    }
+
+    /// Snapshot the current state into the undo stack and clear the
+    /// redo stack. Call this just before a state-changing action.
+    fn commit_action(&mut self) {
+        self.undo_stack.push(self.snapshot());
+        self.redo_stack.clear();
+    }
+
+    fn undo(&mut self) {
+        if let Some(prev) = self.undo_stack.pop() {
+            let current = self.snapshot();
+            self.redo_stack.push(current);
+            self.restore(prev);
+        }
+    }
+
+    fn redo(&mut self) {
+        if let Some(next) = self.redo_stack.pop() {
+            let current = self.snapshot();
+            self.undo_stack.push(current);
+            self.restore(next);
         }
     }
 
@@ -195,9 +227,30 @@ fn handle_input(
 
     let snap_radius = app.hit_radius_px / canvas_size;
 
+    // Keyboard shortcuts: Ctrl/Cmd+Z = undo, Ctrl/Cmd+Shift+Z or
+    // Ctrl/Cmd+Y = redo.
+    let ctrl = is_key_down(KeyCode::LeftControl)
+        || is_key_down(KeyCode::RightControl)
+        || is_key_down(KeyCode::LeftSuper)
+        || is_key_down(KeyCode::RightSuper);
+    let shift = is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift);
+    if ctrl && is_key_pressed(KeyCode::Z) {
+        if shift {
+            app.redo();
+        } else {
+            app.undo();
+        }
+        return;
+    }
+    if ctrl && is_key_pressed(KeyCode::Y) {
+        app.redo();
+        return;
+    }
+
     // Right-click: delete the segment under the cursor (if any).
     if is_mouse_button_pressed(MouseButton::Right) && in_canvas {
         if let Some((gi, si)) = pick_segment_in_glyphs(&app.glyphs, mouse_torus) {
+            app.commit_action();
             app.glyphs[gi].segments.remove(si);
             if app.glyphs[gi].segments.is_empty() {
                 app.glyphs.remove(gi);
@@ -209,19 +262,10 @@ fn handle_input(
     }
 
     if just_pressed_left && in_canvas {
-        // Endpoint hit takes priority over segment-body hit.
-        if let Some((gi, si, kind)) = pick_endpoint(&app.glyphs, mouse_torus, snap_radius) {
-            app.drag = Some(Drag::Modify {
-                glyph_idx: gi,
-                seg_idx: si,
-                kind,
-            });
-        } else if let Some((gi, si)) = pick_segment_in_glyphs(&app.glyphs, mouse_torus) {
-            app.drag = Some(Drag::Modify {
-                glyph_idx: gi,
-                seg_idx: si,
-                kind: ModifyKind::Whole,
-            });
+        if let Some((gi, _si)) = pick_segment_in_glyphs(&app.glyphs, mouse_torus) {
+            // Click on any part of a glyph drags the whole glyph.
+            app.commit_action();
+            app.drag = Some(Drag::MoveGlyph { glyph_idx: gi });
         } else {
             // Snap the start point to a nearby vertex if there is one.
             let start = app.snap_target(mouse_torus, snap_radius).unwrap_or(mouse_torus);
@@ -247,49 +291,10 @@ fn handle_input(
                 Drag::DrawNew { disp, .. } => {
                     *disp = *disp + mouse_delta;
                 }
-                Drag::Modify {
-                    glyph_idx,
-                    seg_idx,
-                    kind,
-                } => {
+                Drag::MoveGlyph { glyph_idx } => {
                     let gi = *glyph_idx;
-                    match kind {
-                        ModifyKind::Start => {
-                            let seg = &mut app.glyphs[gi].segments[*seg_idx];
-                            *seg = seg.move_start(mouse_delta);
-                        }
-                        ModifyKind::End => {
-                            let seg = &mut app.glyphs[gi].segments[*seg_idx];
-                            *seg = seg.move_end(mouse_delta);
-                        }
-                        ModifyKind::Whole => {
-                            // Drag the whole glyph, not just this segment.
-                            for s in &mut app.glyphs[gi].segments {
-                                *s = s.translated(mouse_delta);
-                            }
-                        }
-                    }
-                    // Snap the moving endpoint to any other vertex within
-                    // the hit radius, so the user can join glyphs by
-                    // dragging onto an existing point.
-                    if matches!(kind, ModifyKind::Start | ModifyKind::End) {
-                        let seg = app.glyphs[gi].segments[*seg_idx];
-                        let live = match kind {
-                            ModifyKind::Start => seg.start,
-                            ModifyKind::End => seg.end(),
-                            _ => unreachable!(),
-                        };
-                        if let Some(target) =
-                            snap_excluding_self(&app.glyphs, live, snap_radius, gi, *seg_idx)
-                        {
-                            let delta = live.shortest_to(target);
-                            let s = &mut app.glyphs[gi].segments[*seg_idx];
-                            *s = match kind {
-                                ModifyKind::Start => s.move_start(delta),
-                                ModifyKind::End => s.move_end(delta),
-                                _ => unreachable!(),
-                            };
-                        }
+                    for s in &mut app.glyphs[gi].segments {
+                        *s = s.translated(mouse_delta);
                     }
                     // Rebuild the affected glyph's DCEL so face overlays
                     // follow the drag.
@@ -300,62 +305,42 @@ fn handle_input(
     }
 
     if is_mouse_button_released(MouseButton::Left) {
-        if let Some(Drag::DrawNew { start, disp }) = app.drag.take() {
-            // Discard zero-length scratches.
-            if disp.length() <= 0.005 {
-                return;
+        match app.drag.take() {
+            Some(Drag::DrawNew { start, disp }) => {
+                // Discard zero-length scratches.
+                if disp.length() <= 0.005 {
+                    return;
+                }
+                // Snap the released endpoint to a nearby vertex.
+                let raw_end = start.translate(disp);
+                let snapped_end = app
+                    .snap_target(raw_end, app.hit_radius_px / canvas_size)
+                    .unwrap_or(raw_end);
+                let final_disp = TorusVec::new(
+                    disp.dx + (snapped_end.x() - raw_end.x()),
+                    disp.dy + (snapped_end.y() - raw_end.y()),
+                );
+                // The correction above can be off by ±1 if raw_end was
+                // near the seam and snapped_end wrapped. Normalize by
+                // picking the equivalent (mod 1) shift with the
+                // smallest magnitude.
+                let final_disp = TorusVec::new(
+                    normalize_disp_delta(final_disp.dx, disp.dx),
+                    normalize_disp_delta(final_disp.dy, disp.dy),
+                );
+                app.commit_action();
+                app.place_new_segment(TorusSegment {
+                    start,
+                    disp: final_disp,
+                });
             }
-            // Snap the released endpoint to a nearby vertex (other than
-            // a vertex that's effectively where we already are).
-            let raw_end = start.translate(disp);
-            let snapped_end = app
-                .snap_target(raw_end, app.hit_radius_px / canvas_size)
-                .unwrap_or(raw_end);
-            // Update disp so the segment ends exactly on the snapped vertex
-            // *along the same path the user was drawing* (preserve the lift
-            // implied by `disp`).
-            let final_disp = TorusVec::new(
-                disp.dx + (snapped_end.x() - raw_end.x()),
-                disp.dy + (snapped_end.y() - raw_end.y()),
-            );
-            // The end-x correction above can be off by ±1 if raw_end was
-            // near the seam and snapped_end wrapped. Normalize by picking
-            // the equivalent (mod 1) shift with the smallest magnitude.
-            let final_disp = TorusVec::new(
-                normalize_disp_delta(final_disp.dx, disp.dx),
-                normalize_disp_delta(final_disp.dy, disp.dy),
-            );
-            app.place_new_segment(TorusSegment {
-                start,
-                disp: final_disp,
-            });
-        } else {
-            app.drag = None;
+            Some(Drag::MoveGlyph { .. }) => {
+                // commit_action was called when the drag started; no
+                // additional snapshot needed on release.
+            }
+            None => {}
         }
     }
-}
-
-/// Find the nearest vertex within `radius` of `p`, ignoring vertices
-/// that effectively coincide with `p` itself (the endpoint currently
-/// being dragged is always in the DCEL at its live position, so we
-/// don't want to "snap" to ourselves). Used during endpoint drag.
-fn snap_excluding_self(
-    glyphs: &[Glyph],
-    p: TorusPoint,
-    radius: f32,
-    _gi: usize,
-    _si: usize,
-) -> Option<TorusPoint> {
-    let mut best: Option<(f32, TorusPoint)> = None;
-    for g in glyphs {
-        for v in &g.dcel.vertices {
-            let d = p.distance_to(*v);
-            if d > 1e-5 && d <= radius && best.map_or(true, |(bd, _)| d < bd) {
-                best = Some((d, *v));
-            }
-        }
-    }
-    best.map(|(_, v)| v)
 }
 
 /// Position and size of the hit-radius slider track, in screen pixels.
@@ -386,29 +371,6 @@ fn normalize_disp_delta(candidate: f32, reference: f32) -> f32 {
         }
     }
     best
-}
-
-/// Hit-test endpoints across all glyphs.
-fn pick_endpoint(
-    glyphs: &[Glyph],
-    p: TorusPoint,
-    radius: f32,
-) -> Option<(usize, usize, ModifyKind)> {
-    let mut best: Option<(f32, usize, usize, ModifyKind)> = None;
-    for (gi, g) in glyphs.iter().enumerate() {
-        for (si, seg) in g.segments.iter().enumerate() {
-            for (kind, ep) in [
-                (ModifyKind::Start, seg.start),
-                (ModifyKind::End, seg.end()),
-            ] {
-                let d = p.distance_to(ep);
-                if d <= radius && best.map_or(true, |(bd, _, _, _)| d < bd) {
-                    best = Some((d, gi, si, kind));
-                }
-            }
-        }
-    }
-    best.map(|(_, gi, si, k)| (gi, si, k))
 }
 
 /// Hit-test segments across all glyphs. Returns (glyph_idx, seg_idx).
@@ -694,8 +656,10 @@ fn draw_hud(app: &App) {
     let n_glyphs = app.glyphs.len();
     let n_segs: usize = app.glyphs.iter().map(|g| g.segments.len()).sum();
     let n_faces: usize = app.glyphs.iter().map(|g| g.topological_face_count).sum();
+    let undo_n = app.undo_stack.len();
+    let redo_n = app.redo_stack.len();
     let summary = format!(
-        "glyphs: {n_glyphs}  segments: {n_segs}  faces: {n_faces}    left-drag: draw / move    right-click: delete"
+        "glyphs: {n_glyphs}  segments: {n_segs}  faces: {n_faces}    left-drag: draw / move    right-click: delete    ctrl-z: undo ({undo_n})  ctrl-shift-z: redo ({redo_n})"
     );
     draw_text(
         &summary,

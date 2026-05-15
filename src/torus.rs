@@ -160,24 +160,6 @@ impl TorusSegment {
         }
     }
 
-    /// Move only the start endpoint by `v`. The other endpoint stays put
-    /// on the torus, so the displacement absorbs the change (preserving
-    /// the segment's homotopy class as long as the drag is small).
-    pub fn move_start(self, v: TorusVec) -> Self {
-        Self {
-            start: self.start.translate(v),
-            disp: self.disp - v,
-        }
-    }
-
-    /// Move only the end endpoint by `v`. The start stays put.
-    pub fn move_end(self, v: TorusVec) -> Self {
-        Self {
-            start: self.start,
-            disp: self.disp + v,
-        }
-    }
-
     /// Iterate over the "visible lifts" of this segment in the universal
     /// cover, expressed as (start_xy, end_xy) pairs in ℝ². Together with
     /// integer translates, these tile the plane and cover any portion of
@@ -246,14 +228,4 @@ mod tests {
         assert!(approx_eq(e.y(), 0.1));
     }
 
-    #[test]
-    fn move_end_preserves_start() {
-        let seg = TorusSegment::shortest(
-            TorusPoint::new(0.2, 0.2),
-            TorusPoint::new(0.5, 0.5),
-        );
-        let moved = seg.move_end(TorusVec::new(0.1, 0.0));
-        assert_eq!(moved.start, seg.start);
-        assert!(approx_eq(moved.end().x(), 0.6));
-    }
 }

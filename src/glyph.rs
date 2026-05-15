@@ -516,6 +516,26 @@ pub fn segment_touches_glyph(new_seg: &TorusSegment, glyph: &Glyph) -> bool {
     false
 }
 
+/// Partition a flat list of segments into glyphs (connected components
+/// under the "touches" relation: two segments are in the same group
+/// iff their lifted geometry intersects). Used to recover the glyph
+/// structure when restoring an undo/redo snapshot.
+pub fn partition_into_glyphs(segments: Vec<TorusSegment>) -> Vec<Vec<TorusSegment>> {
+    let mut groups: Vec<Vec<TorusSegment>> = Vec::new();
+    for s in segments {
+        let touched: Vec<usize> = (0..groups.len())
+            .filter(|&i| groups[i].iter().any(|t| segments_touch(&s, t)))
+            .collect();
+        let mut combined = vec![s];
+        // Drain in reverse so earlier indices stay valid.
+        for &i in touched.iter().rev() {
+            combined.extend(groups.remove(i));
+        }
+        groups.push(combined);
+    }
+    groups
+}
+
 fn segments_touch(seg_a: &TorusSegment, seg_b: &TorusSegment) -> bool {
     let a0 = (seg_a.start.x(), seg_a.start.y());
     let a1 = (a0.0 + seg_a.disp.dx, a0.1 + seg_a.disp.dy);
@@ -772,6 +792,30 @@ mod tests {
                 "sub-segment end should be a DCEL vertex"
             );
         }
+    }
+
+    #[test]
+    fn partition_groups_touching_segments_together() {
+        // Two crossing segments → 1 group.
+        let segs = vec![
+            seg(0.3, 0.5, 0.7, 0.5),
+            seg(0.5, 0.3, 0.5, 0.7),
+        ];
+        assert_eq!(partition_into_glyphs(segs).len(), 1);
+    }
+
+    #[test]
+    fn partition_separates_disjoint_groups() {
+        // Two disjoint triangles → 2 groups.
+        let all = vec![
+            seg(0.10, 0.10, 0.20, 0.10),
+            seg(0.20, 0.10, 0.15, 0.20),
+            seg(0.15, 0.20, 0.10, 0.10),
+            seg(0.70, 0.70, 0.80, 0.70),
+            seg(0.80, 0.70, 0.75, 0.80),
+            seg(0.75, 0.80, 0.70, 0.70),
+        ];
+        assert_eq!(partition_into_glyphs(all).len(), 2);
     }
 
     #[test]
