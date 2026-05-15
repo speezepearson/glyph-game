@@ -26,13 +26,84 @@ const EPS: f32 = 1.0 / 1024.0;
 pub struct Glyph {
     pub segments: Vec<TorusSegment>,
     pub dcel: Dcel,
+    /// Number of connected components of T² \ glyph. This is the
+    /// *topological* face count, and differs from the DCEL's
+    /// combinatorial face count whenever the graph has non-separating
+    /// cycles (e.g. a single non-trivial loop on the torus splits into
+    /// 2 combinatorial DCEL face cycles but leaves 1 topological face).
+    pub topological_face_count: usize,
 }
 
 impl Glyph {
     pub fn from_segments(segments: Vec<TorusSegment>) -> Self {
         let dcel = Dcel::build(&segments);
-        Self { segments, dcel }
+        let topological_face_count = compute_topological_face_count(&segments);
+        Self {
+            segments,
+            dcel,
+            topological_face_count,
+        }
     }
+}
+
+const RASTER_GRID: usize = 256;
+
+/// Estimate the number of connected components of T² \ segments by
+/// rasterizing the segments into a square bitmap (with the torus's
+/// wrap-around treated as 4-connected pixel adjacency) and counting
+/// connected blocks of unblocked pixels.
+///
+/// At GRID = 256, two parallel segments closer than ~1/256 ≈ 0.004 of
+/// the viewport may merge after rasterization and undercount their
+/// enclosed strip, but for typical user-drawn segments this is fine.
+fn compute_topological_face_count(segments: &[TorusSegment]) -> usize {
+    if segments.is_empty() {
+        return 1;
+    }
+    let n = RASTER_GRID;
+    let mut blocked = vec![false; n * n];
+    let g = n as f32;
+    for seg in segments {
+        let len = seg.disp.dx.abs().max(seg.disp.dy.abs()).max(0.001);
+        let steps = ((len * g) as usize).max(2) * 3;
+        let sx = seg.start.x();
+        let sy = seg.start.y();
+        for s in 0..=steps {
+            let t = s as f32 / steps as f32;
+            let x = (sx + t * seg.disp.dx).rem_euclid(1.0);
+            let y = (sy + t * seg.disp.dy).rem_euclid(1.0);
+            let cx = ((x * g) as usize).min(n - 1);
+            let cy = ((y * g) as usize).min(n - 1);
+            blocked[cy * n + cx] = true;
+        }
+    }
+    let mut visited = vec![false; n * n];
+    let mut count = 0;
+    let mut stack: Vec<(usize, usize)> = Vec::new();
+    for sy in 0..n {
+        for sx in 0..n {
+            let i = sy * n + sx;
+            if blocked[i] || visited[i] {
+                continue;
+            }
+            visited[i] = true;
+            stack.push((sx, sy));
+            while let Some((x, y)) = stack.pop() {
+                for (dx, dy) in [(-1i32, 0i32), (1, 0), (0, -1), (0, 1)] {
+                    let nx = (x as i32 + dx).rem_euclid(n as i32) as usize;
+                    let ny = (y as i32 + dy).rem_euclid(n as i32) as usize;
+                    let ni = ny * n + nx;
+                    if blocked[ni] || visited[ni] {
+                        continue;
+                    }
+                    visited[ni] = true;
+                    stack.push((nx, ny));
+                }
+            }
+            count += 1;
+        }
+    }
+    count
 }
 
 #[derive(Default)]
@@ -611,6 +682,44 @@ mod tests {
         assert_eq!(d.faces.len(), 2);
         // Both faces should be non-contractible (no polygon).
         assert!(d.faces.iter().all(|f| f.polygon.is_empty()));
+    }
+
+    #[test]
+    fn topological_meridian_does_not_separate_torus() {
+        // A meridian loop is non-separating: cutting T² along it
+        // gives a single open cylinder, not two halves. The DCEL has
+        // 2 combinatorial face cycles, but the topology has 1 face.
+        let s = seg(0.0, 0.5, 1.0, 0.5);
+        let g = Glyph::from_segments(vec![s]);
+        assert_eq!(g.dcel.faces.len(), 2, "combinatorial face count");
+        assert_eq!(
+            g.topological_face_count, 1,
+            "meridian loop is non-separating"
+        );
+    }
+
+    #[test]
+    fn topological_diagonal_loop_has_one_face() {
+        // A (1,1) torus knot is non-separating: it has 2 combinatorial
+        // DCEL faces but only 1 topological face.
+        let s = seg(0.0, 0.0, 1.0, 1.0);
+        let g = Glyph::from_segments(vec![s]);
+        assert_eq!(g.dcel.faces.len(), 2, "expected 2 combinatorial faces");
+        assert_eq!(
+            g.topological_face_count, 1,
+            "expected 1 topological face (loop doesn't separate the torus)"
+        );
+    }
+
+    #[test]
+    fn topological_triangle_has_two_faces() {
+        let segs = vec![
+            seg(0.4, 0.4, 0.6, 0.4),
+            seg(0.6, 0.4, 0.5, 0.6),
+            seg(0.5, 0.6, 0.4, 0.4),
+        ];
+        let g = Glyph::from_segments(segs);
+        assert_eq!(g.topological_face_count, 2);
     }
 
     #[test]
