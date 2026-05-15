@@ -10,7 +10,7 @@ use macroquad::prelude::*;
 
 mod glyph;
 mod torus;
-use glyph::{segment_touches_glyph, triangulate, Glyph};
+use glyph::{triangulate, Glyph};
 use torus::{TorusPoint, TorusSegment, TorusVec};
 
 const ENDPOINT_RADIUS: f32 = 6.0;
@@ -59,10 +59,7 @@ impl App {
     /// glyphs is recovered from this list on `restore` by reconnecting
     /// touching segments.
     fn snapshot(&self) -> Vec<TorusSegment> {
-        self.glyphs
-            .iter()
-            .flat_map(|g| g.segments.iter().copied())
-            .collect()
+        self.glyphs.iter().flat_map(|g| g.segments()).collect()
     }
 
     /// Replace the current glyphs with whatever the given flat segment
@@ -70,7 +67,7 @@ impl App {
     fn restore(&mut self, segments: Vec<TorusSegment>) {
         self.glyphs = glyph::partition_into_glyphs(segments)
             .into_iter()
-            .map(Glyph::from_chopped_segments)
+            .map(Glyph::from_segments)
             .collect();
     }
 
@@ -102,7 +99,7 @@ impl App {
     fn snap_target(&self, p: TorusPoint, radius: f32) -> Option<TorusPoint> {
         let mut best: Option<(f32, TorusPoint)> = None;
         for g in &self.glyphs {
-            for v in &g.dcel.vertices {
+            for v in &g.vertices {
                 let d = p.distance_to(*v);
                 if d <= radius && best.map_or(true, |(bd, _)| d < bd) {
                     best = Some((d, *v));
@@ -114,14 +111,6 @@ impl App {
 
     fn place_new_segment(&mut self, seg: TorusSegment) {
         glyph::add_segment(&mut self.glyphs, seg);
-    }
-
-    fn rebuild_glyph(&mut self, i: usize) {
-        // Drag-time rebuild: don't re-chop the segments (that would
-        // reorder them and invalidate drag indices). Just rebuild the
-        // DCEL on the current segments.
-        let segs = std::mem::take(&mut self.glyphs[i].segments);
-        self.glyphs[i] = Glyph::from_segments(segs);
     }
 }
 
@@ -234,27 +223,33 @@ fn handle_input(
         return;
     }
 
-    // Right-click: delete the segment under the cursor (if any). If
+    // Right-click: delete the edge under the cursor (if any). If
     // removing it disconnects the glyph, the remainder is re-
     // partitioned into multiple glyphs.
     if is_mouse_button_pressed(MouseButton::Right) && in_canvas {
-        if let Some((gi, si)) = pick_segment_in_glyphs(&app.glyphs, mouse_torus) {
+        if let Some((gi, ei)) = pick_edge_in_glyphs(&app.glyphs, mouse_torus) {
             app.commit_action();
-            glyph::remove_segment(&mut app.glyphs, gi, si);
+            glyph::remove_edge(&mut app.glyphs, gi, ei);
         }
         return;
     }
 
     if just_pressed_left && in_canvas {
-        if let Some((gi, _si)) = pick_segment_in_glyphs(&app.glyphs, mouse_torus) {
-            // Click on any part of a glyph drags the whole glyph.
+        // Priority: clicking on (or near) a vertex starts a draw from
+        // that vertex (snapped). Clicking on an edge body but not a
+        // vertex drags the whole glyph. Clicking on empty space starts
+        // a free-floating draw.
+        if let Some(snapped) = app.snap_target(mouse_torus, snap_radius) {
+            app.drag = Some(Drag::DrawNew {
+                start: snapped,
+                disp: TorusVec::zero(),
+            });
+        } else if let Some((gi, _ei)) = pick_edge_in_glyphs(&app.glyphs, mouse_torus) {
             app.commit_action();
             app.drag = Some(Drag::MoveGlyph { glyph_idx: gi });
         } else {
-            // Snap the start point to a nearby vertex if there is one.
-            let start = app.snap_target(mouse_torus, snap_radius).unwrap_or(mouse_torus);
             app.drag = Some(Drag::DrawNew {
-                start,
+                start: mouse_torus,
                 disp: TorusVec::zero(),
             });
         }
@@ -276,13 +271,7 @@ fn handle_input(
                     *disp = *disp + mouse_delta;
                 }
                 Drag::MoveGlyph { glyph_idx } => {
-                    let gi = *glyph_idx;
-                    for s in &mut app.glyphs[gi].segments {
-                        *s = s.translated(mouse_delta);
-                    }
-                    // Rebuild the affected glyph's DCEL so face overlays
-                    // follow the drag.
-                    app.rebuild_glyph(gi);
+                    app.glyphs[*glyph_idx].translate(mouse_delta);
                 }
             }
         }
@@ -357,19 +346,20 @@ fn normalize_disp_delta(candidate: f32, reference: f32) -> f32 {
     best
 }
 
-/// Hit-test segments across all glyphs. Returns (glyph_idx, seg_idx).
-fn pick_segment_in_glyphs(glyphs: &[Glyph], p: TorusPoint) -> Option<(usize, usize)> {
+/// Hit-test edges across all glyphs. Returns (glyph_idx, edge_idx).
+fn pick_edge_in_glyphs(glyphs: &[Glyph], p: TorusPoint) -> Option<(usize, usize)> {
     let hit = 0.012_f32; // ~1.2% of viewport
     let mut best: Option<(f32, usize, usize)> = None;
     for (gi, g) in glyphs.iter().enumerate() {
-        for (si, seg) in g.segments.iter().enumerate() {
-            let d = distance_point_to_segment(seg, p);
+        for ei in 0..g.edges.len() {
+            let seg = g.edge_segment(ei);
+            let d = distance_point_to_segment(&seg, p);
             if d <= hit && best.map_or(true, |(bd, _, _)| d < bd) {
-                best = Some((d, gi, si));
+                best = Some((d, gi, ei));
             }
         }
     }
-    best.map(|(_, gi, si)| (gi, si))
+    best.map(|(_, gi, ei)| (gi, ei))
 }
 
 /// Shortest distance from a torus point `p` to a torus segment, computed
@@ -424,7 +414,7 @@ fn draw_scene(app: &App, origin: Vec2, size: f32) {
     // entire canvas with its color. Inner faces drawn next overwrite
     // the parts that should have a different color.
     for g in &app.glyphs {
-        for f in &g.dcel.faces {
+        for f in &g.faces {
             if f.polygon.is_empty() || f.signed_area >= 0.0 {
                 continue;
             }
@@ -434,7 +424,7 @@ fn draw_scene(app: &App, origin: Vec2, size: f32) {
     // Pass 2: inner faces (positive signed area), filled as tiled
     // polygons.
     for g in &app.glyphs {
-        for f in &g.dcel.faces {
+        for f in &g.faces {
             if f.polygon.is_empty() || f.signed_area <= 0.0 {
                 continue;
             }
@@ -442,10 +432,10 @@ fn draw_scene(app: &App, origin: Vec2, size: f32) {
         }
     }
 
-    // Pass 3: the segments themselves.
+    // Pass 3: the edges themselves.
     let mut to_draw: Vec<TorusSegment> = Vec::new();
     for g in &app.glyphs {
-        to_draw.extend(g.segments.iter().copied());
+        to_draw.extend(g.segments());
     }
     if let Some(Drag::DrawNew { start, disp }) = &app.drag {
         to_draw.push(TorusSegment {
@@ -457,9 +447,23 @@ fn draw_scene(app: &App, origin: Vec2, size: f32) {
     for seg in &to_draw {
         draw_segment_tiled(seg, origin, size, rect_min, rect_max);
     }
-    for seg in &to_draw {
-        draw_endpoint_tiled(seg.start, origin, size, rect_min, rect_max, ENDPOINT_COLOR);
-        draw_endpoint_tiled(seg.end(), origin, size, rect_min, rect_max, ENDPOINT_COLOR);
+    // Pass 4: vertex dots — one per actual DCEL vertex, plus the
+    // endpoints of any in-progress draw.
+    for g in &app.glyphs {
+        for v in &g.vertices {
+            draw_endpoint_tiled(*v, origin, size, rect_min, rect_max, ENDPOINT_COLOR);
+        }
+    }
+    if let Some(Drag::DrawNew { start, disp }) = &app.drag {
+        draw_endpoint_tiled(*start, origin, size, rect_min, rect_max, ENDPOINT_COLOR);
+        draw_endpoint_tiled(
+            start.translate(*disp),
+            origin,
+            size,
+            rect_min,
+            rect_max,
+            ENDPOINT_COLOR,
+        );
     }
 }
 
@@ -638,12 +642,12 @@ fn draw_slider(app: &App) {
 
 fn draw_hud(app: &App) {
     let n_glyphs = app.glyphs.len();
-    let n_segs: usize = app.glyphs.iter().map(|g| g.segments.len()).sum();
+    let n_edges: usize = app.glyphs.iter().map(|g| g.edges.len()).sum();
     let n_faces: usize = app.glyphs.iter().map(|g| g.topological_face_count).sum();
     let undo_n = app.undo_stack.len();
     let redo_n = app.redo_stack.len();
     let summary = format!(
-        "glyphs: {n_glyphs}  segments: {n_segs}  faces: {n_faces}    left-drag: draw / move    right-click: delete    ctrl-z: undo ({undo_n})  ctrl-shift-z: redo ({redo_n})"
+        "glyphs: {n_glyphs}  edges: {n_edges}  faces: {n_faces}    left-drag: draw / move    right-click: delete    ctrl-z: undo ({undo_n})  ctrl-shift-z: redo ({redo_n})"
     );
     draw_text(
         &summary,
@@ -653,11 +657,10 @@ fn draw_hud(app: &App) {
         Color::from_rgba(180, 180, 200, 255),
     );
     for (i, g) in app.glyphs.iter().enumerate() {
-        let v = g.dcel.vertices.len();
-        let e = g.dcel.half_edges.len() / 2;
+        let v = g.vertices.len();
+        let e = g.edges.len();
         let f = g.topological_face_count;
-        let s = g.segments.len();
-        let line = format!("  glyph {i}: V={v}  E={e}  F={f}  segments={s}");
+        let line = format!("  glyph {i}: V={v}  E={e}  F={f}");
         let y = 22.0 + 18.0 * (i + 1) as f32;
         draw_text(&line, 12.0, y, 16.0, Color::from_rgba(160, 160, 180, 255));
     }

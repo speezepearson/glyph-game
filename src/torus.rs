@@ -152,14 +152,6 @@ impl TorusSegment {
         self.start.translate(self.disp)
     }
 
-    /// Translate the whole segment (both endpoints) by `v`.
-    pub fn translated(self, v: TorusVec) -> Self {
-        Self {
-            start: self.start.translate(v),
-            disp: self.disp,
-        }
-    }
-
     /// Iterate over the "visible lifts" of this segment in the universal
     /// cover, expressed as (start_xy, end_xy) pairs in ℝ². Together with
     /// integer translates, these tile the plane and cover any portion of
