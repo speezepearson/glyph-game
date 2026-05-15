@@ -74,6 +74,14 @@ The web frontend is a single static page (`web/index.html`) that loads
 the compiled `glyph_game.wasm` through macroquad's miniquad JS shim.
 There's no server-side component.
 
+### Deploying to GitHub Pages
+
+`.github/workflows/deploy-pages.yml` builds the WASM and publishes
+`web/` on every push to `main` (and on manual workflow dispatch). To
+enable it once: repo **Settings → Pages → Build and deployment →
+Source: GitHub Actions**. The deployed URL will appear in the workflow
+run summary.
+
 ## Why this stack
 
 - **[macroquad](https://macroquad.rs)** for rendering and input: minimal
