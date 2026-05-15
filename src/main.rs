@@ -290,8 +290,8 @@ fn handle_input(
                     .snap_target(raw_end, app.hit_radius_px / canvas_size)
                     .unwrap_or(raw_end);
                 let final_disp = TorusVec::new(
-                    disp.dx + (snapped_end.x() - raw_end.x()),
-                    disp.dy + (snapped_end.y() - raw_end.y()),
+                    disp.dx + (snapped_end.x.to_f32() - raw_end.x.to_f32()),
+                    disp.dy + (snapped_end.y.to_f32() - raw_end.y.to_f32()),
                 );
                 // The correction above can be off by ±1 if raw_end was
                 // near the seam and snapped_end wrapped. Normalize by
@@ -366,8 +366,8 @@ fn pick_edge_in_glyphs(glyphs: &[Glyph], p: TorusPoint) -> Option<(usize, usize)
 /// by minimizing over all visible lifts of the segment in the universal
 /// cover (with `p` lifted to its canonical representative).
 fn distance_point_to_segment(seg: &TorusSegment, p: TorusPoint) -> f32 {
-    let px = p.x();
-    let py = p.y();
+    let px = p.x.to_f32();
+    let py = p.y.to_f32();
     let mut best = f32::INFINITY;
     for ((ax, ay), (bx, by)) in seg.visible_lifts() {
         let d = dist_point_to_seg_2d(px, py, ax, ay, bx, by);
@@ -490,8 +490,8 @@ fn draw_endpoint_tiled(
 ) {
     for i in -1..=1 {
         for j in -1..=1 {
-            let sx = origin.x + (p.x() + i as f32) * size;
-            let sy = origin.y + (p.y() + j as f32) * size;
+            let sx = origin.x + (p.x.to_f32() + i as f32) * size;
+            let sy = origin.y + (p.y.to_f32() + j as f32) * size;
             // Don't draw far-away copies.
             if sx + ENDPOINT_RADIUS < rect_min.x || sx - ENDPOINT_RADIUS > rect_max.x {
                 continue;

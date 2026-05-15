@@ -114,7 +114,7 @@ impl Glyph {
 
     /// Reconstruct an edge's geometric `TorusSegment` for drawing /
     /// hit-testing. Defined as: starts at u's canonical position,
-    /// disp = v.pos + winding - u.pos.
+    /// disp = u.signed_diff_to(v) + winding.
     pub fn edge_segment(&self, edge_idx: usize) -> TorusSegment {
         let e = &self.edges[edge_idx];
         let u = self.vertices[e.u as usize];
@@ -122,8 +122,8 @@ impl Glyph {
         TorusSegment {
             start: u,
             disp: TorusVec::new(
-                v.x() - u.x() + e.winding.0 as f32,
-                v.y() - u.y() + e.winding.1 as f32,
+                u.x.signed_diff_to(v.x) + e.winding.0 as f32,
+                u.y.signed_diff_to(v.y) + e.winding.1 as f32,
             ),
         }
     }
@@ -210,9 +210,9 @@ pub fn segment_touches_glyph(new_seg: &TorusSegment, glyph: &Glyph) -> bool {
 }
 
 fn segments_touch(seg_a: &TorusSegment, seg_b: &TorusSegment) -> bool {
-    let a0 = (seg_a.start.x(), seg_a.start.y());
+    let a0 = (seg_a.start.x.to_f32(), seg_a.start.y.to_f32());
     let a1 = (a0.0 + seg_a.disp.dx, a0.1 + seg_a.disp.dy);
-    let b0c = (seg_b.start.x(), seg_b.start.y());
+    let b0c = (seg_b.start.x.to_f32(), seg_b.start.y.to_f32());
     let b1c = (b0c.0 + seg_b.disp.dx, b0c.1 + seg_b.disp.dy);
     for li in -1..=1 {
         for lj in -1..=1 {
@@ -296,8 +296,8 @@ fn chop(vertices: &mut Vec<TorusPoint>, edges: &mut Vec<Edge>) {
             let v = vertices[vid as usize];
             for li in -1..=1 {
                 for lj in -1..=1 {
-                    let vx = v.x() + li as f32;
-                    let vy = v.y() + lj as f32;
+                    let vx = v.x.to_f32() + li as f32;
+                    let vy = v.y.to_f32() + lj as f32;
                     let t = ((vx - u_pos.0) * di_x + (vy - u_pos.1) * di_y) / len2;
                     if t <= EPS || t >= 1.0 - EPS {
                         continue;
@@ -342,12 +342,10 @@ fn chop(vertices: &mut Vec<TorusPoint>, edges: &mut Vec<Edge>) {
             if sub_dx * sub_dx + sub_dy * sub_dy < EPS * EPS {
                 continue;
             }
-            // Sub-edge in "u at canonical, v at canonical + winding"
-            // form: shift so vid_lo's lift = its canonical. Then
-            //   vid_hi's lift = lifted_hi - lifted_lo + lo_pos
-            //   winding = lifted_hi - lifted_lo + lo_pos - hi_pos
-            let raw_wx = sub_dx + lo_pos.x() - hi_pos.x();
-            let raw_wy = sub_dy + lo_pos.y() - hi_pos.y();
+            // Sub-edge in the lifted_disp = signed_diff_to + winding
+            // convention: winding = lifted_disp - signed_diff_to.
+            let raw_wx = sub_dx - lo_pos.x.signed_diff_to(hi_pos.x);
+            let raw_wy = sub_dy - lo_pos.y.signed_diff_to(hi_pos.y);
             new_edges.push(Edge {
                 u: vid_lo,
                 v: vid_hi,
@@ -363,9 +361,9 @@ fn chop(vertices: &mut Vec<TorusPoint>, edges: &mut Vec<Edge>) {
 fn edge_lifted_geometry(vertices: &[TorusPoint], e: Edge) -> ((f32, f32), f32, f32) {
     let u = vertices[e.u as usize];
     let v = vertices[e.v as usize];
-    let dx = v.x() - u.x() + e.winding.0 as f32;
-    let dy = v.y() - u.y() + e.winding.1 as f32;
-    ((u.x(), u.y()), dx, dy)
+    let dx = u.x.signed_diff_to(v.x) + e.winding.0 as f32;
+    let dy = u.y.signed_diff_to(v.y) + e.winding.1 as f32;
+    ((u.x.to_f32(), u.y.to_f32()), dx, dy)
 }
 
 fn find_or_insert_vertex(vs: &mut Vec<TorusPoint>, p: TorusPoint) -> VertexId {
@@ -378,12 +376,15 @@ fn find_or_insert_vertex(vs: &mut Vec<TorusPoint>, p: TorusPoint) -> VertexId {
     (vs.len() - 1) as VertexId
 }
 
-/// Given a segment drawn with start S, canonical end E, and lifted disp,
-/// return the integer winding (rounding off f32 noise).
+/// Given a segment drawn with start S, canonical end E, and lifted
+/// disp, return the integer winding. Convention: the lifted disp is
+/// `start.signed_diff_to(end) + winding`, where `signed_diff_to` is
+/// translation-invariant, so winding is too. (Round to suppress f32
+/// noise on the integer.)
 fn winding_from_disp(start: TorusPoint, end: TorusPoint, disp: TorusVec) -> (i32, i32) {
-    let raw_x = start.x() + disp.dx - end.x();
-    let raw_y = start.y() + disp.dy - end.y();
-    (raw_x.round() as i32, raw_y.round() as i32)
+    let sd_x = start.x.signed_diff_to(end.x);
+    let sd_y = start.y.signed_diff_to(end.y);
+    ((disp.dx - sd_x).round() as i32, (disp.dy - sd_y).round() as i32)
 }
 
 /// 2D segment-segment intersection in ℝ², parameterized along both
@@ -496,13 +497,13 @@ fn half_edge_disp(
     let v_pos = vertices[edge.v as usize];
     if he.origin == edge.u {
         (
-            v_pos.x() - u_pos.x() + edge.winding.0 as f32,
-            v_pos.y() - u_pos.y() + edge.winding.1 as f32,
+            u_pos.x.signed_diff_to(v_pos.x) + edge.winding.0 as f32,
+            u_pos.y.signed_diff_to(v_pos.y) + edge.winding.1 as f32,
         )
     } else {
         (
-            u_pos.x() - v_pos.x() - edge.winding.0 as f32,
-            u_pos.y() - v_pos.y() - edge.winding.1 as f32,
+            v_pos.x.signed_diff_to(u_pos.x) - edge.winding.0 as f32,
+            v_pos.y.signed_diff_to(u_pos.y) - edge.winding.1 as f32,
         )
     }
 }
@@ -591,8 +592,8 @@ fn build_half_edges_and_faces(
         let start_v = half_edges[cycle[0] as usize].origin;
         let start_pos = vertices[start_v as usize];
         let mut polygon: Vec<(f32, f32)> = Vec::with_capacity(cycle.len());
-        let mut x = start_pos.x();
-        let mut y = start_pos.y();
+        let mut x = start_pos.x.to_f32();
+        let mut y = start_pos.y.to_f32();
         polygon.push((x, y));
         let mut total_x = 0.0;
         let mut total_y = 0.0;
@@ -983,9 +984,9 @@ mod tests {
             for j in (i + 1)..g.edges.len() {
                 let a = g.edge_segment(i);
                 let b = g.edge_segment(j);
-                let a0 = (a.start.x(), a.start.y());
+                let a0 = (a.start.x.to_f32(), a.start.y.to_f32());
                 let a1 = (a0.0 + a.disp.dx, a0.1 + a.disp.dy);
-                let b0c = (b.start.x(), b.start.y());
+                let b0c = (b.start.x.to_f32(), b.start.y.to_f32());
                 let b1c = (b0c.0 + b.disp.dx, b0c.1 + b.disp.dy);
                 for li in -1..=1 {
                     for lj in -1..=1 {
@@ -1093,5 +1094,61 @@ mod tests {
     #[test]
     fn fuzz_invariants_seed_2() {
         run_fuzz(2, 120);
+    }
+
+    /// Building the same sequence of segments — once as-is and once
+    /// with every input shifted by a uniform delta — produces glyphs
+    /// with the same structure. The Coord type's translation
+    /// invariance, plus the lifted_disp = signed_diff_to + winding
+    /// convention, are supposed to make this hold across glyph
+    /// operations even when the shift drags vertices across the 0/1
+    /// boundary.
+    #[test]
+    fn fuzz_glyph_structure_translation_invariant() {
+        let mut rng = Lcg::new(99);
+        for trial in 0..20 {
+            let shift = TorusVec::new(rng.next_f32() * 4.0 - 2.0, rng.next_f32() * 4.0 - 2.0);
+            let segs: Vec<TorusSegment> = (0..10).map(|_| random_segment(&mut rng)).collect();
+            let mut glyphs_a: Vec<Glyph> = Vec::new();
+            let mut glyphs_b: Vec<Glyph> = Vec::new();
+            for s in &segs {
+                add_segment(&mut glyphs_a, *s);
+                add_segment(
+                    &mut glyphs_b,
+                    TorusSegment {
+                        start: s.start.translate(shift),
+                        disp: s.disp,
+                    },
+                );
+            }
+            assert_eq!(
+                glyphs_a.len(),
+                glyphs_b.len(),
+                "trial {trial} (shift={:?}): glyph count differs",
+                shift
+            );
+            for (gi, (ga, gb)) in glyphs_a.iter().zip(glyphs_b.iter()).enumerate() {
+                assert_eq!(
+                    ga.vertices.len(),
+                    gb.vertices.len(),
+                    "trial {trial} glyph {gi}: V"
+                );
+                assert_eq!(
+                    ga.edges.len(),
+                    gb.edges.len(),
+                    "trial {trial} glyph {gi}: E"
+                );
+                assert_eq!(
+                    ga.faces.len(),
+                    gb.faces.len(),
+                    "trial {trial} glyph {gi}: F (combinatorial)"
+                );
+                // topological_face_count comes from rasterization on
+                // a fixed grid and is fundamentally only approximately
+                // translation-invariant (cell-quantization can merge
+                // or split nearby segments depending on alignment).
+                // Don't assert on it here.
+            }
+        }
     }
 }
