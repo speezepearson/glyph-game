@@ -38,10 +38,6 @@ impl Glyph {
 #[derive(Default)]
 pub struct Dcel {
     pub vertices: Vec<TorusPoint>,
-    // Kept as part of the DCEL even though rendering only reads the
-    // derived faces — having vertices/half-edges/faces available is the
-    // point of using a DCEL representation in the first place.
-    #[allow(dead_code)]
     pub half_edges: Vec<HalfEdge>,
     pub faces: Vec<Face>,
 }
@@ -430,10 +426,42 @@ fn segments_touch(seg_a: &TorusSegment, seg_b: &TorusSegment) -> bool {
     false
 }
 
-/// Triangulate a simple polygon (CCW or CW) by ear-clipping. Returns
-/// triangles as flat triples of vertex coordinates. Returns an empty
-/// vec for degenerate polygons.
+/// Triangulate a polygon by ear-clipping. Handles "weakly simple"
+/// polygons (where the same vertex position appears more than once,
+/// e.g. a polygon with a dangling-edge spike) by splitting at the
+/// duplicate pair into two simpler polygons and recursing.
 pub fn triangulate(poly: &[(f32, f32)]) -> Vec<[(f32, f32); 3]> {
+    let n = poly.len();
+    if n < 3 {
+        return Vec::new();
+    }
+    // Find any pair of equal positions at non-adjacent indices and
+    // split: part A goes around the spike, part B is the spike itself
+    // (degenerate, area ≈ 0, contributes nothing). This is what makes
+    // face polygons with dangling edges renderable.
+    for i in 0..n {
+        for j in (i + 2)..n {
+            if i == 0 && j == n - 1 {
+                // Cyclically adjacent — first and last vertex of the
+                // polygon are the same position. Not a true spike.
+                continue;
+            }
+            if (poly[i].0 - poly[j].0).abs() < EPS
+                && (poly[i].1 - poly[j].1).abs() < EPS
+            {
+                let mut part_a: Vec<(f32, f32)> = poly[..=i].to_vec();
+                part_a.extend_from_slice(&poly[(j + 1)..]);
+                let part_b: Vec<(f32, f32)> = poly[i..=j].to_vec();
+                let mut out = triangulate(&part_a);
+                out.extend(triangulate(&part_b));
+                return out;
+            }
+        }
+    }
+    triangulate_simple(poly)
+}
+
+fn triangulate_simple(poly: &[(f32, f32)]) -> Vec<[(f32, f32); 3]> {
     let n = poly.len();
     if n < 3 {
         return Vec::new();
@@ -583,6 +611,53 @@ mod tests {
         assert_eq!(d.faces.len(), 2);
         // Both faces should be non-contractible (no polygon).
         assert!(d.faces.iter().all(|f| f.polygon.is_empty()));
+    }
+
+    #[test]
+    fn triangle_plus_crossing_segment_has_two_faces() {
+        // Triangle ABC plus a segment EF that crosses edge AB at D.
+        // E is above (outside) the triangle, F is below the top edge (inside).
+        // The new segment ends up "partly in, partly out" of the triangle.
+        let segs = vec![
+            seg(0.3, 0.3, 0.7, 0.3), // A→B (top)
+            seg(0.7, 0.3, 0.5, 0.7), // B→C
+            seg(0.5, 0.7, 0.3, 0.3), // C→A
+            seg(0.5, 0.1, 0.5, 0.5), // E→F, crosses AB at (0.5, 0.3)
+        ];
+        let d = Dcel::build(&segs);
+        // 6 vertices: A, B, C, D (intersection), E, F.
+        assert_eq!(d.vertices.len(), 6, "vertex count");
+        // 2 faces: an inner one containing the triangle, an outer one.
+        // (The two "dangling" half-edges off D — one into the triangle,
+        // one outside — don't split either face; they just elongate the
+        // face boundary cycle.)
+        assert_eq!(d.faces.len(), 2, "face count");
+        let positive = d.faces.iter().filter(|f| f.signed_area > 1e-4).count();
+        let negative = d.faces.iter().filter(|f| f.signed_area < -1e-4).count();
+        assert_eq!(positive, 1, "expected one positive-area face");
+        assert_eq!(negative, 1, "expected one negative-area face");
+        // Sanity: face colors are different so they're visually distinguishable.
+        let ca = d.faces[0].color;
+        let cb = d.faces[1].color;
+        let same = (ca.r - cb.r).abs() < 1e-3
+            && (ca.g - cb.g).abs() < 1e-3
+            && (ca.b - cb.b).abs() < 1e-3;
+        assert!(!same, "expected distinct face colors");
+
+        // The inner face polygon includes a "spike" (the dangling edge
+        // traversed once in each direction), so a vertex appears twice
+        // in the boundary. Make sure the renderer can still triangulate
+        // it — otherwise the face draws nothing.
+        let inner = d
+            .faces
+            .iter()
+            .find(|f| f.signed_area > 0.0)
+            .expect("inner face");
+        let tris = triangulate(&inner.polygon);
+        assert!(
+            !tris.is_empty(),
+            "ear-clip produced no triangles for a non-degenerate inner face"
+        );
     }
 }
 

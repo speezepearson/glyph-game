@@ -556,13 +556,24 @@ fn clip_line_to_rect(p0: Vec2, p1: Vec2, rmin: Vec2, rmax: Vec2) -> Option<(Vec2
 fn draw_hud(app: &App) {
     let n_glyphs = app.glyphs.len();
     let n_segs: usize = app.glyphs.iter().map(|g| g.segments.len()).sum();
-    let n_faces: usize = app
-        .glyphs
-        .iter()
-        .map(|g| g.dcel.faces.iter().filter(|f| !f.polygon.is_empty()).count())
-        .sum();
-    let line = format!(
+    let n_faces: usize = app.glyphs.iter().map(|g| g.dcel.faces.len()).sum();
+    let summary = format!(
         "glyphs: {n_glyphs}  segments: {n_segs}  faces: {n_faces}    left-drag: draw / move    right-click: delete"
     );
-    draw_text(&line, 12.0, 22.0, 18.0, Color::from_rgba(180, 180, 200, 255));
+    draw_text(
+        &summary,
+        12.0,
+        22.0,
+        18.0,
+        Color::from_rgba(180, 180, 200, 255),
+    );
+    for (i, g) in app.glyphs.iter().enumerate() {
+        let v = g.dcel.vertices.len();
+        let e = g.dcel.half_edges.len() / 2;
+        let f = g.dcel.faces.len();
+        let s = g.segments.len();
+        let line = format!("  glyph {i}: V={v}  E={e}  F={f}  segments={s}");
+        let y = 22.0 + 18.0 * (i + 1) as f32;
+        draw_text(&line, 12.0, y, 16.0, Color::from_rgba(160, 160, 180, 255));
+    }
 }
