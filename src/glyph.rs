@@ -35,6 +35,9 @@ pub struct Glyph {
 }
 
 impl Glyph {
+    /// Build a glyph from the given segments as-is, without splitting
+    /// at intersection points. Used while a drag is in progress, so
+    /// segment indices stay stable across frames.
     pub fn from_segments(segments: Vec<TorusSegment>) -> Self {
         let dcel = Dcel::build(&segments);
         let topological_face_count = compute_topological_face_count(&segments);
@@ -44,6 +47,41 @@ impl Glyph {
             topological_face_count,
         }
     }
+
+    /// Build a glyph, splitting each input segment at every torus
+    /// intersection point so that no two of the resulting constituent
+    /// segments cross except at shared endpoints. Used when adding a
+    /// new segment, so the glyph's stored segments always satisfy
+    /// that invariant immediately after the add.
+    pub fn from_chopped_segments(segments: Vec<TorusSegment>) -> Self {
+        let dcel = Dcel::build(&segments);
+        let chopped = extract_segments_from_dcel(&dcel);
+        // The DCEL on `chopped` is structurally identical to the one
+        // we just built (same vertex positions and adjacencies), so
+        // reuse it instead of rebuilding.
+        let topological_face_count = compute_topological_face_count(&chopped);
+        Self {
+            segments: chopped,
+            dcel,
+            topological_face_count,
+        }
+    }
+}
+
+fn extract_segments_from_dcel(dcel: &Dcel) -> Vec<TorusSegment> {
+    let mut out = Vec::with_capacity(dcel.half_edges.len() / 2);
+    for (i, he) in dcel.half_edges.iter().enumerate() {
+        // Emit one segment per edge (the half-edge with the lower index).
+        if he.twin <= i {
+            continue;
+        }
+        let start = dcel.vertices[he.origin];
+        out.push(TorusSegment {
+            start,
+            disp: he.disp,
+        });
+    }
+    out
 }
 
 const RASTER_GRID: usize = 256;
@@ -709,6 +747,31 @@ mod tests {
             g.topological_face_count, 1,
             "expected 1 topological face (loop doesn't separate the torus)"
         );
+    }
+
+    #[test]
+    fn chopped_segments_split_at_crossings() {
+        // Two segments crossing at (0.5, 0.5). After chopping, each
+        // original segment becomes two sub-segments meeting at the
+        // crossing — four sub-segments total.
+        let segs = vec![
+            seg(0.3, 0.5, 0.7, 0.5),
+            seg(0.5, 0.3, 0.5, 0.7),
+        ];
+        let g = Glyph::from_chopped_segments(segs);
+        assert_eq!(g.segments.len(), 4);
+        // No two chopped segments overlap at an interior point: every
+        // endpoint of every chopped segment must be a DCEL vertex.
+        for s in &g.segments {
+            assert!(
+                g.dcel.vertices.iter().any(|v| v.distance_to(s.start) < 1e-3),
+                "sub-segment start should be a DCEL vertex"
+            );
+            assert!(
+                g.dcel.vertices.iter().any(|v| v.distance_to(s.end()) < 1e-3),
+                "sub-segment end should be a DCEL vertex"
+            );
+        }
     }
 
     #[test]

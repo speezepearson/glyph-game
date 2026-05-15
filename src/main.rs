@@ -14,8 +14,15 @@ use glyph::{segment_touches_glyph, triangulate, Glyph};
 use torus::{TorusPoint, TorusSegment, TorusVec};
 
 const ENDPOINT_RADIUS: f32 = 6.0;
-const HIT_RADIUS_PX: f32 = 10.0;
+const HIT_RADIUS_DEFAULT_PX: f32 = 10.0;
+const HIT_RADIUS_MIN_PX: f32 = 2.0;
+const HIT_RADIUS_MAX_PX: f32 = 40.0;
 const LINE_WIDTH: f32 = 2.5;
+
+const SLIDER_WIDTH: f32 = 220.0;
+const SLIDER_HEIGHT: f32 = 8.0;
+const SLIDER_KNOB_RADIUS: f32 = 8.0;
+const SLIDER_MARGIN: f32 = 20.0;
 
 /// What the user is currently doing with the mouse.
 enum Drag {
@@ -44,6 +51,8 @@ enum ModifyKind {
 struct App {
     glyphs: Vec<Glyph>,
     drag: Option<Drag>,
+    hit_radius_px: f32,
+    slider_drag: bool,
 }
 
 impl App {
@@ -51,6 +60,8 @@ impl App {
         Self {
             glyphs: Vec::new(),
             drag: None,
+            hit_radius_px: HIT_RADIUS_DEFAULT_PX,
+            slider_drag: false,
         }
     }
 
@@ -70,27 +81,26 @@ impl App {
     }
 
     /// Take a freshly-drawn segment and either start a new glyph or
-    /// merge it into every existing glyph it touches.
+    /// merge it into every existing glyph it touches. The resulting
+    /// glyph's segments are *chopped* at every intersection point so
+    /// no two of its constituent segments cross except at endpoints.
     fn place_new_segment(&mut self, seg: TorusSegment) {
         let mut touched: Vec<usize> = (0..self.glyphs.len())
             .filter(|&i| segment_touches_glyph(&seg, &self.glyphs[i]))
             .collect();
-        if touched.is_empty() {
-            self.glyphs.push(Glyph::from_segments(vec![seg]));
-            return;
-        }
         let mut combined: Vec<TorusSegment> = vec![seg];
-        // Drain touched glyphs in reverse so removals don't invalidate
-        // earlier indices.
         touched.sort();
         for &i in touched.iter().rev() {
             let g = self.glyphs.remove(i);
             combined.extend(g.segments);
         }
-        self.glyphs.push(Glyph::from_segments(combined));
+        self.glyphs.push(Glyph::from_chopped_segments(combined));
     }
 
     fn rebuild_glyph(&mut self, i: usize) {
+        // Drag-time rebuild: don't re-chop the segments (that would
+        // reorder them and invalidate drag indices). Just rebuild the
+        // DCEL on the current segments.
         let segs = std::mem::take(&mut self.glyphs[i].segments);
         self.glyphs[i] = Glyph::from_segments(segs);
     }
@@ -134,6 +144,7 @@ async fn main() {
         draw_canvas_frame(canvas_origin, canvas_size);
         draw_scene(&app, canvas_origin, canvas_size);
         draw_hud(&app);
+        draw_slider(&app);
 
         prev_mouse_px = Some(mouse_px);
         next_frame().await;
@@ -166,7 +177,23 @@ fn handle_input(
     canvas_size: f32,
 ) {
     let just_pressed_left = is_mouse_button_pressed(MouseButton::Left);
-    let snap_radius = HIT_RADIUS_PX / canvas_size;
+    let just_released_left = is_mouse_button_released(MouseButton::Left);
+
+    // Slider takes priority over canvas interactions.
+    let (slider_pos, slider_size) = slider_rect();
+    if just_pressed_left && point_in_slider(mouse_px, slider_pos, slider_size) {
+        app.slider_drag = true;
+    }
+    if app.slider_drag {
+        let t = ((mouse_px.x - slider_pos.x) / slider_size.x).clamp(0.0, 1.0);
+        app.hit_radius_px = HIT_RADIUS_MIN_PX + t * (HIT_RADIUS_MAX_PX - HIT_RADIUS_MIN_PX);
+        if just_released_left {
+            app.slider_drag = false;
+        }
+        return;
+    }
+
+    let snap_radius = app.hit_radius_px / canvas_size;
 
     // Right-click: delete the segment under the cursor (if any).
     if is_mouse_button_pressed(MouseButton::Right) && in_canvas {
@@ -242,6 +269,28 @@ fn handle_input(
                             }
                         }
                     }
+                    // Snap the moving endpoint to any other vertex within
+                    // the hit radius, so the user can join glyphs by
+                    // dragging onto an existing point.
+                    if matches!(kind, ModifyKind::Start | ModifyKind::End) {
+                        let seg = app.glyphs[gi].segments[*seg_idx];
+                        let live = match kind {
+                            ModifyKind::Start => seg.start,
+                            ModifyKind::End => seg.end(),
+                            _ => unreachable!(),
+                        };
+                        if let Some(target) =
+                            snap_excluding_self(&app.glyphs, live, snap_radius, gi, *seg_idx)
+                        {
+                            let delta = live.shortest_to(target);
+                            let s = &mut app.glyphs[gi].segments[*seg_idx];
+                            *s = match kind {
+                                ModifyKind::Start => s.move_start(delta),
+                                ModifyKind::End => s.move_end(delta),
+                                _ => unreachable!(),
+                            };
+                        }
+                    }
                     // Rebuild the affected glyph's DCEL so face overlays
                     // follow the drag.
                     app.rebuild_glyph(gi);
@@ -260,7 +309,7 @@ fn handle_input(
             // a vertex that's effectively where we already are).
             let raw_end = start.translate(disp);
             let snapped_end = app
-                .snap_target(raw_end, HIT_RADIUS_PX / canvas_size)
+                .snap_target(raw_end, app.hit_radius_px / canvas_size)
                 .unwrap_or(raw_end);
             // Update disp so the segment ends exactly on the snapped vertex
             // *along the same path the user was drawing* (preserve the lift
@@ -284,6 +333,45 @@ fn handle_input(
             app.drag = None;
         }
     }
+}
+
+/// Find the nearest vertex within `radius` of `p`, ignoring vertices
+/// that effectively coincide with `p` itself (the endpoint currently
+/// being dragged is always in the DCEL at its live position, so we
+/// don't want to "snap" to ourselves). Used during endpoint drag.
+fn snap_excluding_self(
+    glyphs: &[Glyph],
+    p: TorusPoint,
+    radius: f32,
+    _gi: usize,
+    _si: usize,
+) -> Option<TorusPoint> {
+    let mut best: Option<(f32, TorusPoint)> = None;
+    for g in glyphs {
+        for v in &g.dcel.vertices {
+            let d = p.distance_to(*v);
+            if d > 1e-5 && d <= radius && best.map_or(true, |(bd, _)| d < bd) {
+                best = Some((d, *v));
+            }
+        }
+    }
+    best.map(|(_, v)| v)
+}
+
+/// Position and size of the hit-radius slider track, in screen pixels.
+fn slider_rect() -> (Vec2, Vec2) {
+    let w = screen_width();
+    let x = w - SLIDER_WIDTH - SLIDER_MARGIN;
+    let y = SLIDER_MARGIN;
+    (vec2(x, y), vec2(SLIDER_WIDTH, SLIDER_HEIGHT))
+}
+
+fn point_in_slider(p: Vec2, track_pos: Vec2, track_size: Vec2) -> bool {
+    let pad = SLIDER_KNOB_RADIUS + 2.0;
+    p.x >= track_pos.x - pad
+        && p.x <= track_pos.x + track_size.x + pad
+        && p.y >= track_pos.y - pad
+        && p.y <= track_pos.y + track_size.y + pad
 }
 
 /// Pick the equivalent (mod 1) value of `candidate` that's closest to
@@ -561,6 +649,45 @@ fn clip_line_to_rect(p0: Vec2, p1: Vec2, rmin: Vec2, rmax: Vec2) -> Option<(Vec2
         }
     }
     Some((p0 + d * t_enter, p0 + d * t_exit))
+}
+
+fn draw_slider(app: &App) {
+    let (pos, size) = slider_rect();
+    draw_rectangle(pos.x, pos.y, size.x, size.y, Color::from_rgba(40, 40, 50, 255));
+    draw_rectangle_lines(
+        pos.x,
+        pos.y,
+        size.x,
+        size.y,
+        1.0,
+        Color::from_rgba(90, 90, 110, 255),
+    );
+    let t = ((app.hit_radius_px - HIT_RADIUS_MIN_PX)
+        / (HIT_RADIUS_MAX_PX - HIT_RADIUS_MIN_PX))
+        .clamp(0.0, 1.0);
+    let knob_x = pos.x + t * size.x;
+    let knob_y = pos.y + size.y * 0.5;
+    draw_circle(
+        knob_x,
+        knob_y,
+        SLIDER_KNOB_RADIUS,
+        Color::from_rgba(220, 200, 90, 255),
+    );
+    draw_circle_lines(
+        knob_x,
+        knob_y,
+        SLIDER_KNOB_RADIUS,
+        1.5,
+        Color::from_rgba(20, 20, 30, 255),
+    );
+    let label = format!("hit radius: {:>4.1}px", app.hit_radius_px);
+    draw_text(
+        &label,
+        pos.x,
+        pos.y + size.y + 18.0,
+        16.0,
+        Color::from_rgba(180, 180, 200, 255),
+    );
 }
 
 fn draw_hud(app: &App) {
