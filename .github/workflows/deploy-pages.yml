@@ -3,19 +3,22 @@ name: Deploy to GitHub Pages
 on:
   push:
     branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
   workflow_dispatch:
 
 permissions:
-  contents: read
-  pages: write
-  id-token: write
+  contents: write       # push to gh-pages
+  pull-requests: write  # comment preview URL on PRs
 
+# Serialize all writes to gh-pages so concurrent deploys don't race.
 concurrency:
-  group: pages
+  group: gh-pages-deploy
   cancel-in-progress: false
 
 jobs:
-  build:
+  build-and-deploy:
+    if: github.event.action != 'closed'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -30,18 +33,56 @@ jobs:
       - name: Build WASM bundle
         run: ./scripts/build-web.sh
 
-      - uses: actions/configure-pages@v5
+      - name: Resolve deploy destination
+        id: dest
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "dir=pr/${{ github.event.pull_request.number }}" >>"$GITHUB_OUTPUT"
+            echo "url=https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/pr/${{ github.event.pull_request.number }}/" >>"$GITHUB_OUTPUT"
+          else
+            echo "dir=." >>"$GITHUB_OUTPUT"
+            echo "url=https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/" >>"$GITHUB_OUTPUT"
+          fi
 
-      - uses: actions/upload-pages-artifact@v3
+      - name: Publish to gh-pages
+        uses: peaceiris/actions-gh-pages@v4
         with:
-          path: web
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./web
+          destination_dir: ${{ steps.dest.outputs.dir }}
+          keep_files: true   # don't wipe sibling deploys (main / other PR previews)
+          commit_message: "Deploy ${{ steps.dest.outputs.dir }} from ${{ github.sha }}"
 
-  deploy:
-    needs: build
+      - name: Comment preview URL on PR
+        if: github.event_name == 'pull_request'
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: glyph-game-preview
+          message: |
+            Preview: ${{ steps.dest.outputs.url }}
+
+            (Updates on every push. Removed when the PR is closed.)
+
+  cleanup-preview:
+    if: github.event_name == 'pull_request' && github.event.action == 'closed'
     runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - id: deployment
-        uses: actions/deploy-pages@v4
+      - name: Checkout gh-pages
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          fetch-depth: 0
+
+      - name: Remove preview directory
+        env:
+          PR_NUM: ${{ github.event.pull_request.number }}
+        run: |
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          if [ -d "pr/$PR_NUM" ]; then
+            git rm -rf "pr/$PR_NUM"
+            git commit -m "Remove preview for PR #$PR_NUM"
+            git push
+          else
+            echo "No preview directory pr/$PR_NUM; nothing to clean up."
+          fi

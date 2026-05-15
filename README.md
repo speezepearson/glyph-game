@@ -76,11 +76,18 @@ There's no server-side component.
 
 ### Deploying to GitHub Pages
 
-`.github/workflows/deploy-pages.yml` builds the WASM and publishes
-`web/` on every push to `main` (and on manual workflow dispatch). To
-enable it once: repo **Settings → Pages → Build and deployment →
-Source: GitHub Actions**. The deployed URL will appear in the workflow
-run summary.
+`.github/workflows/deploy-pages.yml` builds the WASM and publishes it
+to a `gh-pages` branch:
+
+- Push to `main` → deployed at the site root.
+- Open or update a PR → deployed under `pr/<number>/` and the URL is
+  posted as a sticky PR comment.
+- Close (or merge) a PR → the corresponding `pr/<number>/` directory is
+  removed from `gh-pages`.
+
+One-time setup: after the first workflow run creates the `gh-pages`
+branch, go to repo **Settings → Pages → Build and deployment** and set
+**Source: Deploy from a branch**, **Branch: `gh-pages` / `/(root)`**.
 
 ## Why this stack
 
