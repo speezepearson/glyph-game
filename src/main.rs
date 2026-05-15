@@ -112,21 +112,8 @@ impl App {
         best.map(|(_, v)| v)
     }
 
-    /// Take a freshly-drawn segment and either start a new glyph or
-    /// merge it into every existing glyph it touches. The resulting
-    /// glyph's segments are *chopped* at every intersection point so
-    /// no two of its constituent segments cross except at endpoints.
     fn place_new_segment(&mut self, seg: TorusSegment) {
-        let mut touched: Vec<usize> = (0..self.glyphs.len())
-            .filter(|&i| segment_touches_glyph(&seg, &self.glyphs[i]))
-            .collect();
-        let mut combined: Vec<TorusSegment> = vec![seg];
-        touched.sort();
-        for &i in touched.iter().rev() {
-            let g = self.glyphs.remove(i);
-            combined.extend(g.segments);
-        }
-        self.glyphs.push(Glyph::from_chopped_segments(combined));
+        glyph::add_segment(&mut self.glyphs, seg);
     }
 
     fn rebuild_glyph(&mut self, i: usize) {
@@ -247,16 +234,13 @@ fn handle_input(
         return;
     }
 
-    // Right-click: delete the segment under the cursor (if any).
+    // Right-click: delete the segment under the cursor (if any). If
+    // removing it disconnects the glyph, the remainder is re-
+    // partitioned into multiple glyphs.
     if is_mouse_button_pressed(MouseButton::Right) && in_canvas {
         if let Some((gi, si)) = pick_segment_in_glyphs(&app.glyphs, mouse_torus) {
             app.commit_action();
-            app.glyphs[gi].segments.remove(si);
-            if app.glyphs[gi].segments.is_empty() {
-                app.glyphs.remove(gi);
-            } else {
-                app.rebuild_glyph(gi);
-            }
+            glyph::remove_segment(&mut app.glyphs, gi, si);
         }
         return;
     }
