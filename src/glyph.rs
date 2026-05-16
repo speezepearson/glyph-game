@@ -33,7 +33,7 @@
 
 use macroquad::prelude::Color;
 
-use crate::torus::{TorusPoint, TorusSegment, TorusVec};
+use crate::torus_point::{TorusPoint, TorusSegment, TorusVec};
 
 /// Vertex-merge tolerance in torus coordinates (≈ one pixel at 900px).
 const EPS: f32 = 1.0 / 1024.0;
@@ -68,8 +68,15 @@ pub struct HalfEdge {
 }
 
 pub struct Face {
-    /// Polygon traced in the universal cover. Empty if the boundary
-    /// walk didn't close on the same lift (non-contractible face).
+    /// The torus point relative to which `polygon` is expressed.
+    /// (The cycle's first vertex.) Renderers convert polygon offsets
+    /// to screen positions by anchoring at this vertex's lift.
+    pub anchor: TorusPoint,
+    /// Boundary polygon as ℝ² offsets from `anchor`, in the universal
+    /// cover. Empty if the boundary walk didn't close on the same lift
+    /// (non-contractible face). Translation-invariant by construction:
+    /// every offset is a sum of half-edge disps, each computed via
+    /// `signed_diff_to`.
     pub polygon: Vec<(f32, f32)>,
     pub signed_area: f32,
     pub color: Color,
@@ -210,17 +217,13 @@ pub fn segment_touches_glyph(new_seg: &TorusSegment, glyph: &Glyph) -> bool {
 }
 
 fn segments_touch(seg_a: &TorusSegment, seg_b: &TorusSegment) -> bool {
-    let a0 = (seg_a.start.x.to_f32(), seg_a.start.y.to_f32());
-    let a1 = (a0.0 + seg_a.disp.dx, a0.1 + seg_a.disp.dy);
-    let b0c = (seg_b.start.x.to_f32(), seg_b.start.y.to_f32());
-    let b1c = (b0c.0 + seg_b.disp.dx, b0c.1 + seg_b.disp.dy);
-    for li in -1..=1 {
-        for lj in -1..=1 {
-            let b0 = (b0c.0 + li as f32, b0c.1 + lj as f32);
-            let b1 = (b1c.0 + li as f32, b1c.1 + lj as f32);
-            if seg_seg_intersect(a0, a1, b0, b1).is_some() {
-                return true;
-            }
+    // Anchor at seg_a.start; seg_a sits at (0, 0)→disp, and seg_b's
+    // 9 lifts are produced relative to the same anchor.
+    let a0 = (0.0, 0.0);
+    let a1 = (seg_a.disp.dx, seg_a.disp.dy);
+    for (_, (b0, b1)) in seg_b.lifts_anchored_at(seg_a.start) {
+        if seg_seg_intersect(a0, a1, b0, b1).is_some() {
+            return true;
         }
     }
     false
@@ -244,47 +247,52 @@ fn chop(vertices: &mut Vec<TorusPoint>, edges: &mut Vec<Edge>) {
         .map(|e| vec![(0.0, e.u), (1.0, e.v)])
         .collect();
 
-    // Pairwise intersections across the 3×3 lift block.
+    // Pairwise intersections across the 3×3 lift block. For each pair
+    // (i, j) we anchor the math at edge i's u vertex: seg_i goes from
+    // (0, 0) to its lifted disp, and seg_j's 9 lifts are placed
+    // relative to the same anchor via shortest_to.
     for i in 0..edges.len() {
+        let u_i = vertices[edges[i].u as usize];
+        let (i_dx, i_dy) = edge_disp_r2(vertices, edges[i]);
+        let a0 = (0.0, 0.0);
+        let a1 = (i_dx, i_dy);
         for j in i..edges.len() {
-            let (i_u_pos, i_dx, i_dy) = edge_lifted_geometry(vertices, edges[i]);
-            let (j_u_pos, j_dx, j_dy) = edge_lifted_geometry(vertices, edges[j]);
-            let a0 = (i_u_pos.0, i_u_pos.1);
-            let a1 = (a0.0 + i_dx, a0.1 + i_dy);
-            let b0c = (j_u_pos.0, j_u_pos.1);
-            let b1c = (b0c.0 + j_dx, b0c.1 + j_dy);
-            for li in -1..=1 {
-                for lj in -1..=1 {
-                    if i == j && li == 0 && lj == 0 {
-                        continue;
-                    }
-                    let ox = li as f32;
-                    let oy = lj as f32;
-                    let b0 = (b0c.0 + ox, b0c.1 + oy);
-                    let b1 = (b1c.0 + ox, b1c.1 + oy);
-                    let Some((ta, tb, px, py)) = seg_seg_intersect(a0, a1, b0, b1) else {
-                        continue;
-                    };
-                    if ta > EPS && ta < 1.0 - EPS {
-                        let vid = find_or_insert_vertex(vertices, TorusPoint::new(px, py));
-                        splits[i].push((ta, vid));
-                    }
-                    if tb > EPS && tb < 1.0 - EPS {
-                        let vid =
-                            find_or_insert_vertex(vertices, TorusPoint::new(px - ox, py - oy));
-                        splits[j].push((tb, vid));
-                    }
+            let seg_j = TorusSegment {
+                start: vertices[edges[j].u as usize],
+                disp: {
+                    let (jx, jy) = edge_disp_r2(vertices, edges[j]);
+                    TorusVec::new(jx, jy)
+                },
+            };
+            for ((li, lj), (b0, b1)) in seg_j.lifts_anchored_at(u_i) {
+                if i == j && li == 0 && lj == 0 {
+                    continue;
+                }
+                let Some((ta, tb, px, py)) = seg_seg_intersect(a0, a1, b0, b1) else {
+                    continue;
+                };
+                // Both ta and tb identify the SAME torus point — the
+                // intersection in u_i's frame at (px, py). Convert to
+                // a canonical TorusPoint once and reuse the vid.
+                let p_torus = u_i.translate(TorusVec::new(px, py));
+                let vid = find_or_insert_vertex(vertices, p_torus);
+                if ta > EPS && ta < 1.0 - EPS {
+                    splits[i].push((ta, vid));
+                }
+                if tb > EPS && tb < 1.0 - EPS {
+                    splits[j].push((tb, vid));
                 }
             }
         }
     }
 
-    // Defensive vertex-on-segment pass: any vertex that happens to fall
-    // on an edge's interior (e.g. from a chained chop where seg-seg
-    // intersection landed slightly off-endpoint) should still split the
-    // edge.
+    // Defensive vertex-on-segment pass, anchored at u_i: any vertex
+    // landing on the edge's interior gets a split entry, catching
+    // T-junctions that seg-seg intersection might have missed at a
+    // tolerance boundary.
     for i in 0..edges.len() {
-        let (u_pos, di_x, di_y) = edge_lifted_geometry(vertices, edges[i]);
+        let u_i = vertices[edges[i].u as usize];
+        let (di_x, di_y) = edge_disp_r2(vertices, edges[i]);
         let len2 = di_x * di_x + di_y * di_y;
         if len2 < EPS * EPS {
             continue;
@@ -293,17 +301,17 @@ fn chop(vertices: &mut Vec<TorusPoint>, edges: &mut Vec<Edge>) {
             if vid == edges[i].u || vid == edges[i].v {
                 continue;
             }
-            let v = vertices[vid as usize];
+            let v_rel = u_i.shortest_to(vertices[vid as usize]);
             for li in -1..=1 {
                 for lj in -1..=1 {
-                    let vx = v.x.to_f32() + li as f32;
-                    let vy = v.y.to_f32() + lj as f32;
-                    let t = ((vx - u_pos.0) * di_x + (vy - u_pos.1) * di_y) / len2;
+                    let vx = v_rel.dx + li as f32;
+                    let vy = v_rel.dy + lj as f32;
+                    let t = (vx * di_x + vy * di_y) / len2;
                     if t <= EPS || t >= 1.0 - EPS {
                         continue;
                     }
-                    let proj_x = u_pos.0 + t * di_x;
-                    let proj_y = u_pos.1 + t * di_y;
+                    let proj_x = t * di_x;
+                    let proj_y = t * di_y;
                     let ddx = vx - proj_x;
                     let ddy = vy - proj_y;
                     if ddx * ddx + ddy * ddy < EPS * EPS {
@@ -323,27 +331,24 @@ fn chop(vertices: &mut Vec<TorusPoint>, edges: &mut Vec<Edge>) {
         ss.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     }
 
-    // Rebuild edges from the sub-pieces between consecutive split points.
+    // Rebuild edges from the sub-pieces between consecutive split
+    // points. Anchored at u_i: lifted positions along the edge are
+    // (t * di_x, t * di_y) directly.
     let mut new_edges: Vec<Edge> = Vec::with_capacity(edges.len());
     for (i, ss) in splits.iter().enumerate() {
-        let (u_pos, di_x, di_y) = edge_lifted_geometry(vertices, edges[i]);
+        let (di_x, di_y) = edge_disp_r2(vertices, edges[i]);
         for k in 0..ss.len().saturating_sub(1) {
             let (t_lo, vid_lo) = ss[k];
             let (t_hi, vid_hi) = ss[k + 1];
             let lo_pos = vertices[vid_lo as usize];
             let hi_pos = vertices[vid_hi as usize];
-            let lifted_lo_x = u_pos.0 + t_lo * di_x;
-            let lifted_lo_y = u_pos.1 + t_lo * di_y;
-            let lifted_hi_x = u_pos.0 + t_hi * di_x;
-            let lifted_hi_y = u_pos.1 + t_hi * di_y;
-            // Skip degenerate sub-edges (zero lifted length).
-            let sub_dx = lifted_hi_x - lifted_lo_x;
-            let sub_dy = lifted_hi_y - lifted_lo_y;
+            let sub_dx = (t_hi - t_lo) * di_x;
+            let sub_dy = (t_hi - t_lo) * di_y;
             if sub_dx * sub_dx + sub_dy * sub_dy < EPS * EPS {
                 continue;
             }
-            // Sub-edge in the lifted_disp = signed_diff_to + winding
-            // convention: winding = lifted_disp - signed_diff_to.
+            // Sub-edge in (u at canonical, v at canonical + winding) form:
+            //   winding = sub_disp - signed_diff_to(lo_pos, hi_pos)
             let raw_wx = sub_dx - lo_pos.x.signed_diff_to(hi_pos.x);
             let raw_wy = sub_dy - lo_pos.y.signed_diff_to(hi_pos.y);
             new_edges.push(Edge {
@@ -356,14 +361,17 @@ fn chop(vertices: &mut Vec<TorusPoint>, edges: &mut Vec<Edge>) {
     *edges = new_edges;
 }
 
-/// Returns (u-vertex canonical position, edge dx in ℝ², edge dy in ℝ²)
-/// where the edge is laid out with u at its canonical position.
-fn edge_lifted_geometry(vertices: &[TorusPoint], e: Edge) -> ((f32, f32), f32, f32) {
+/// Lifted ℝ² displacement of an edge, computed translation-invariantly
+/// from the two vertex positions and the integer winding. The result
+/// is the same regardless of any shift applied uniformly to every
+/// vertex, because `signed_diff_to` is exactly translation-invariant.
+fn edge_disp_r2(vertices: &[TorusPoint], e: Edge) -> (f32, f32) {
     let u = vertices[e.u as usize];
     let v = vertices[e.v as usize];
-    let dx = u.x.signed_diff_to(v.x) + e.winding.0 as f32;
-    let dy = u.y.signed_diff_to(v.y) + e.winding.1 as f32;
-    ((u.x.to_f32(), u.y.to_f32()), dx, dy)
+    (
+        u.x.signed_diff_to(v.x) + e.winding.0 as f32,
+        u.y.signed_diff_to(v.y) + e.winding.1 as f32,
+    )
 }
 
 fn find_or_insert_vertex(vs: &mut Vec<TorusPoint>, p: TorusPoint) -> VertexId {
@@ -493,18 +501,13 @@ fn half_edge_disp(
 ) -> (f32, f32) {
     let he = &half_edges[h as usize];
     let edge = &edges[he.edge as usize];
-    let u_pos = vertices[edge.u as usize];
-    let v_pos = vertices[edge.v as usize];
+    let (fwd_x, fwd_y) = edge_disp_r2(vertices, *edge);
     if he.origin == edge.u {
-        (
-            u_pos.x.signed_diff_to(v_pos.x) + edge.winding.0 as f32,
-            u_pos.y.signed_diff_to(v_pos.y) + edge.winding.1 as f32,
-        )
+        (fwd_x, fwd_y)
     } else {
-        (
-            v_pos.x.signed_diff_to(u_pos.x) - edge.winding.0 as f32,
-            v_pos.y.signed_diff_to(u_pos.y) - edge.winding.1 as f32,
-        )
+        // Reverse: identical line in ℝ², opposite direction. Negate
+        // exactly (avoids antipode asymmetry of signed_diff_to).
+        (-fwd_x, -fwd_y)
     }
 }
 
@@ -591,21 +594,23 @@ fn build_half_edges_and_faces(
 
         let start_v = half_edges[cycle[0] as usize].origin;
         let start_pos = vertices[start_v as usize];
+        // Trace the polygon in a frame anchored at start_pos: every
+        // (x, y) is the offset from start_pos in ℝ². Half-edge disps
+        // accumulate naturally.
         let mut polygon: Vec<(f32, f32)> = Vec::with_capacity(cycle.len());
-        let mut x = start_pos.x.to_f32();
-        let mut y = start_pos.y.to_f32();
+        let mut x = 0.0f32;
+        let mut y = 0.0f32;
         polygon.push((x, y));
-        let mut total_x = 0.0;
-        let mut total_y = 0.0;
         for &he in &cycle {
             let (dx, dy) = half_edge_disp(vertices, edges, &half_edges, he);
             x += dx;
             y += dy;
-            total_x += dx;
-            total_y += dy;
             polygon.push((x, y));
         }
-        let closed = total_x.abs() < EPS && total_y.abs() < EPS;
+        // The cycle closes iff the final offset is back at the origin
+        // (the same lift of start_pos).
+        let (closing_x, closing_y) = polygon.last().copied().unwrap_or((0.0, 0.0));
+        let closed = closing_x.abs() < EPS && closing_y.abs() < EPS;
         if closed {
             polygon.pop();
         } else {
@@ -614,6 +619,7 @@ fn build_half_edges_and_faces(
         let signed_area = polygon_signed_area(&polygon);
         let color = face_color(&polygon);
         faces.push(Face {
+            anchor: start_pos,
             polygon,
             signed_area,
             color,
@@ -787,14 +793,23 @@ fn compute_topological_face_count(vertices: &[TorusPoint], edges: &[Edge]) -> us
     let n = RASTER_GRID;
     let mut blocked = vec![false; n * n];
     let g = n as f32;
+    // Anchor at vertices[0] — a meaningful coord (the glyph's first
+    // vertex), not an arbitrary literal. Each edge's lifted positions
+    // are computed relative to this anchor; the flood-fill count is
+    // invariant under any uniform shift of all vertices.
+    let anchor = vertices[0];
     for e in edges {
-        let (u_pos, dx, dy) = edge_lifted_geometry(vertices, *e);
+        let u = vertices[e.u as usize];
+        let (dx, dy) = edge_disp_r2(vertices, *e);
+        let u_rel = anchor.shortest_to(u);
         let len = dx.abs().max(dy.abs()).max(0.001);
         let steps = ((len * g) as usize).max(2) * 3;
         for s in 0..=steps {
             let t = s as f32 / steps as f32;
-            let x = (u_pos.0 + t * dx).rem_euclid(1.0);
-            let y = (u_pos.1 + t * dy).rem_euclid(1.0);
+            let rel_x = u_rel.dx + t * dx;
+            let rel_y = u_rel.dy + t * dy;
+            let x = rel_x.rem_euclid(1.0);
+            let y = rel_y.rem_euclid(1.0);
             let cx = ((x * g) as usize).min(n - 1);
             let cy = ((y * g) as usize).min(n - 1);
             blocked[cy * n + cx] = true;
@@ -984,29 +999,24 @@ mod tests {
             for j in (i + 1)..g.edges.len() {
                 let a = g.edge_segment(i);
                 let b = g.edge_segment(j);
-                let a0 = (a.start.x.to_f32(), a.start.y.to_f32());
-                let a1 = (a0.0 + a.disp.dx, a0.1 + a.disp.dy);
-                let b0c = (b.start.x.to_f32(), b.start.y.to_f32());
-                let b1c = (b0c.0 + b.disp.dx, b0c.1 + b.disp.dy);
-                for li in -1..=1 {
-                    for lj in -1..=1 {
-                        let ox = li as f32;
-                        let oy = lj as f32;
-                        let b0 = (b0c.0 + ox, b0c.1 + oy);
-                        let b1 = (b1c.0 + ox, b1c.1 + oy);
-                        let Some((_ta, _tb, px, py)) = seg_seg_intersect(a0, a1, b0, b1) else {
-                            continue;
-                        };
-                        let p = TorusPoint::new(px, py);
-                        let at_a =
-                            p.distance_to(a.start) < TOL || p.distance_to(a.end()) < TOL;
-                        let at_b =
-                            p.distance_to(b.start) < TOL || p.distance_to(b.end()) < TOL;
-                        if !(at_a && at_b) {
-                            return Err(format!(
-                                "edges {i} and {j} cross at ({px:.4}, {py:.4}) — not at an endpoint of both"
-                            ));
-                        }
+                // Anchor at a.start; iterate the 9 lifts of b in that
+                // frame.
+                let a0 = (0.0, 0.0);
+                let a1 = (a.disp.dx, a.disp.dy);
+                for (_, (b0, b1)) in b.lifts_anchored_at(a.start) {
+                    let Some((_ta, _tb, px, py)) = seg_seg_intersect(a0, a1, b0, b1) else {
+                        continue;
+                    };
+                    // Intersection in a.start's frame; convert back.
+                    let p = a.start.translate(TorusVec::new(px, py));
+                    let at_a =
+                        p.distance_to(a.start) < TOL || p.distance_to(a.end()) < TOL;
+                    let at_b =
+                        p.distance_to(b.start) < TOL || p.distance_to(b.end()) < TOL;
+                    if !(at_a && at_b) {
+                        return Err(format!(
+                            "edges {i} and {j} cross at ({px:.4}, {py:.4}) (frame anchored at a.start) — not at an endpoint of both"
+                        ));
                     }
                 }
             }

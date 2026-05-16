@@ -8,10 +8,11 @@
 
 use macroquad::prelude::*;
 
+mod coord;
 mod glyph;
-mod torus;
+mod torus_point;
 use glyph::{triangulate, Glyph};
-use torus::{TorusPoint, TorusSegment, TorusVec};
+use torus_point::{TorusPoint, TorusSegment, TorusVec};
 
 const ENDPOINT_RADIUS: f32 = 6.0;
 const HIT_RADIUS_DEFAULT_PX: f32 = 10.0;
@@ -37,6 +38,12 @@ struct App {
     drag: Option<Drag>,
     hit_radius_px: f32,
     slider_drag: bool,
+    /// The torus point sitting at the center of the canvas viewport.
+    /// All rendering anchors here: signed_diff_to(viewport_anchor, p)
+    /// gives p's position relative to the canvas center, which the
+    /// renderer scales into a screen pixel. Stable across frames;
+    /// the seam appears at the canvas edges (the viewport's antipode).
+    viewport_anchor: TorusPoint,
     /// Past states, most recent on top. `undo` pops one and restores it.
     undo_stack: Vec<Vec<TorusSegment>>,
     /// States that were undone and can be re-applied.
@@ -50,6 +57,11 @@ impl App {
             drag: None,
             hit_radius_px: HIT_RADIUS_DEFAULT_PX,
             slider_drag: false,
+            // Default to (0.5, 0.5) — the center of the canonical
+            // fundamental domain. Picked so the seam lands at the
+            // canvas edges (the antipode of the anchor). A future
+            // panning UI would change this.
+            viewport_anchor: TorusPoint::new(0.5, 0.5),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
         }
@@ -284,23 +296,18 @@ fn handle_input(
                 if disp.length() <= 0.005 {
                     return;
                 }
-                // Snap the released endpoint to a nearby vertex.
+                // Snap the released endpoint to a nearby vertex. The
+                // correction is `raw_end → snapped_end` along the
+                // shortest path on the torus — exactly what
+                // signed_diff_to gives. (Old code did a canonical-rep
+                // subtraction plus a manual normalize-by-±1, both
+                // dropped in favor of this.)
                 let raw_end = start.translate(disp);
                 let snapped_end = app
                     .snap_target(raw_end, app.hit_radius_px / canvas_size)
                     .unwrap_or(raw_end);
-                let final_disp = TorusVec::new(
-                    disp.dx + (snapped_end.x.to_f32() - raw_end.x.to_f32()),
-                    disp.dy + (snapped_end.y.to_f32() - raw_end.y.to_f32()),
-                );
-                // The correction above can be off by ±1 if raw_end was
-                // near the seam and snapped_end wrapped. Normalize by
-                // picking the equivalent (mod 1) shift with the
-                // smallest magnitude.
-                let final_disp = TorusVec::new(
-                    normalize_disp_delta(final_disp.dx, disp.dx),
-                    normalize_disp_delta(final_disp.dy, disp.dy),
-                );
+                let correction = raw_end.shortest_to(snapped_end);
+                let final_disp = TorusVec::new(disp.dx + correction.dx, disp.dy + correction.dy);
                 app.commit_action();
                 app.place_new_segment(TorusSegment {
                     start,
@@ -332,20 +339,6 @@ fn point_in_slider(p: Vec2, track_pos: Vec2, track_size: Vec2) -> bool {
         && p.y <= track_pos.y + track_size.y + pad
 }
 
-/// Pick the equivalent (mod 1) value of `candidate` that's closest to
-/// `reference`. Used to keep a snapped-endpoint correction from
-/// changing the segment's homotopy class.
-fn normalize_disp_delta(candidate: f32, reference: f32) -> f32 {
-    let mut best = candidate;
-    for k in -1..=1 {
-        let v = candidate + k as f32;
-        if (v - reference).abs() < (best - reference).abs() {
-            best = v;
-        }
-    }
-    best
-}
-
 /// Hit-test edges across all glyphs. Returns (glyph_idx, edge_idx).
 fn pick_edge_in_glyphs(glyphs: &[Glyph], p: TorusPoint) -> Option<(usize, usize)> {
     let hit = 0.012_f32; // ~1.2% of viewport
@@ -362,15 +355,13 @@ fn pick_edge_in_glyphs(glyphs: &[Glyph], p: TorusPoint) -> Option<(usize, usize)
     best.map(|(_, gi, ei)| (gi, ei))
 }
 
-/// Shortest distance from a torus point `p` to a torus segment, computed
-/// by minimizing over all visible lifts of the segment in the universal
-/// cover (with `p` lifted to its canonical representative).
+/// Shortest distance from a torus point `p` to a torus segment.
+/// Anchored at `p` itself: `p` sits at (0, 0) in the working frame,
+/// and we iterate the segment's 9 lifts in that frame.
 fn distance_point_to_segment(seg: &TorusSegment, p: TorusPoint) -> f32 {
-    let px = p.x.to_f32();
-    let py = p.y.to_f32();
     let mut best = f32::INFINITY;
-    for ((ax, ay), (bx, by)) in seg.visible_lifts() {
-        let d = dist_point_to_seg_2d(px, py, ax, ay, bx, by);
+    for (_, ((ax, ay), (bx, by))) in seg.lifts_anchored_at(p) {
+        let d = dist_point_to_seg_2d(0.0, 0.0, ax, ay, bx, by);
         if d < best {
             best = d;
         }
@@ -409,6 +400,7 @@ fn draw_canvas_frame(origin: Vec2, size: f32) {
 fn draw_scene(app: &App, origin: Vec2, size: f32) {
     let rect_min = origin;
     let rect_max = origin + vec2(size, size);
+    let anchor = app.viewport_anchor;
 
     // Pass 1: outer faces (negative signed area). For each, tint the
     // entire canvas with its color. Inner faces drawn next overwrite
@@ -428,7 +420,9 @@ fn draw_scene(app: &App, origin: Vec2, size: f32) {
             if f.polygon.is_empty() || f.signed_area <= 0.0 {
                 continue;
             }
-            draw_face_tiled(&f.polygon, f.color, origin, size, rect_min, rect_max);
+            draw_face_tiled(
+                &f.polygon, f.anchor, anchor, f.color, origin, size, rect_min, rect_max,
+            );
         }
     }
 
@@ -445,19 +439,20 @@ fn draw_scene(app: &App, origin: Vec2, size: f32) {
     }
 
     for seg in &to_draw {
-        draw_segment_tiled(seg, origin, size, rect_min, rect_max);
+        draw_segment_tiled(seg, anchor, origin, size, rect_min, rect_max);
     }
     // Pass 4: vertex dots — one per actual DCEL vertex, plus the
     // endpoints of any in-progress draw.
     for g in &app.glyphs {
         for v in &g.vertices {
-            draw_endpoint_tiled(*v, origin, size, rect_min, rect_max, ENDPOINT_COLOR);
+            draw_endpoint_tiled(*v, anchor, origin, size, rect_min, rect_max, ENDPOINT_COLOR);
         }
     }
     if let Some(Drag::DrawNew { start, disp }) = &app.drag {
-        draw_endpoint_tiled(*start, origin, size, rect_min, rect_max, ENDPOINT_COLOR);
+        draw_endpoint_tiled(*start, anchor, origin, size, rect_min, rect_max, ENDPOINT_COLOR);
         draw_endpoint_tiled(
             start.translate(*disp),
+            anchor,
             origin,
             size,
             rect_min,
@@ -470,10 +465,25 @@ fn draw_scene(app: &App, origin: Vec2, size: f32) {
 const ENDPOINT_COLOR: Color = Color::new(0.9, 0.85, 0.3, 1.0);
 const LINE_COLOR: Color = Color::new(0.85, 0.9, 1.0, 1.0);
 
-fn draw_segment_tiled(seg: &TorusSegment, origin: Vec2, size: f32, rect_min: Vec2, rect_max: Vec2) {
-    for ((ax, ay), (bx, by)) in seg.visible_lifts() {
-        let pa = origin + vec2(ax, ay) * size;
-        let pb = origin + vec2(bx, by) * size;
+/// Map a position in the viewport's anchor frame (signed_diff units,
+/// i.e. (-0.5, 0.5] for the primary tile) to a screen pixel. The
+/// viewport anchor sits at the canvas's center pixel.
+fn rel_to_screen(rx: f32, ry: f32, canvas_origin: Vec2, canvas_size: f32) -> Vec2 {
+    let center = canvas_origin + vec2(canvas_size, canvas_size) * 0.5;
+    center + vec2(rx, ry) * canvas_size
+}
+
+fn draw_segment_tiled(
+    seg: &TorusSegment,
+    anchor: TorusPoint,
+    canvas_origin: Vec2,
+    canvas_size: f32,
+    rect_min: Vec2,
+    rect_max: Vec2,
+) {
+    for (_, ((ax, ay), (bx, by))) in seg.lifts_anchored_at(anchor) {
+        let pa = rel_to_screen(ax, ay, canvas_origin, canvas_size);
+        let pb = rel_to_screen(bx, by, canvas_origin, canvas_size);
         if let Some((c0, c1)) = clip_line_to_rect(pa, pb, rect_min, rect_max) {
             draw_line(c0.x, c0.y, c1.x, c1.y, LINE_WIDTH, LINE_COLOR);
         }
@@ -482,36 +492,45 @@ fn draw_segment_tiled(seg: &TorusSegment, origin: Vec2, size: f32, rect_min: Vec
 
 fn draw_endpoint_tiled(
     p: TorusPoint,
-    origin: Vec2,
-    size: f32,
+    anchor: TorusPoint,
+    canvas_origin: Vec2,
+    canvas_size: f32,
     rect_min: Vec2,
     rect_max: Vec2,
     color: Color,
 ) {
+    let v = anchor.shortest_to(p);
     for i in -1..=1 {
         for j in -1..=1 {
-            let sx = origin.x + (p.x.to_f32() + i as f32) * size;
-            let sy = origin.y + (p.y.to_f32() + j as f32) * size;
-            // Don't draw far-away copies.
-            if sx + ENDPOINT_RADIUS < rect_min.x || sx - ENDPOINT_RADIUS > rect_max.x {
+            let s = rel_to_screen(
+                v.dx + i as f32,
+                v.dy + j as f32,
+                canvas_origin,
+                canvas_size,
+            );
+            if s.x + ENDPOINT_RADIUS < rect_min.x || s.x - ENDPOINT_RADIUS > rect_max.x {
                 continue;
             }
-            if sy + ENDPOINT_RADIUS < rect_min.y || sy - ENDPOINT_RADIUS > rect_max.y {
+            if s.y + ENDPOINT_RADIUS < rect_min.y || s.y - ENDPOINT_RADIUS > rect_max.y {
                 continue;
             }
-            draw_circle(sx, sy, ENDPOINT_RADIUS, color);
-            draw_circle_lines(sx, sy, ENDPOINT_RADIUS, 1.5, Color::from_rgba(20, 20, 30, 255));
+            draw_circle(s.x, s.y, ENDPOINT_RADIUS, color);
+            draw_circle_lines(s.x, s.y, ENDPOINT_RADIUS, 1.5, Color::from_rgba(20, 20, 30, 255));
         }
     }
 }
 
-/// Fill a face polygon (in torus [0,1)² coords) by triangulating and
-/// drawing every integer translate that overlaps the canvas.
+/// Fill a face by triangulating its boundary polygon and drawing
+/// every integer translate that overlaps the canvas. The polygon's
+/// coords are offsets from `face_anchor`; we shift into the
+/// viewport's frame via `viewport_anchor.shortest_to(face_anchor)`.
 fn draw_face_tiled(
     polygon: &[(f32, f32)],
+    face_anchor: TorusPoint,
+    viewport_anchor: TorusPoint,
     color: Color,
-    origin: Vec2,
-    size: f32,
+    canvas_origin: Vec2,
+    canvas_size: f32,
     rect_min: Vec2,
     rect_max: Vec2,
 ) {
@@ -519,23 +538,25 @@ fn draw_face_tiled(
     if tris.is_empty() {
         return;
     }
-    // Polygon's bounding box (in torus coords).
+    // Polygon in viewport's frame: shift each offset by the
+    // face-anchor's offset from the viewport.
+    let shift = viewport_anchor.shortest_to(face_anchor);
     let (mut min_x, mut min_y) = (f32::INFINITY, f32::INFINITY);
     let (mut max_x, mut max_y) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
     for &(x, y) in polygon {
-        min_x = min_x.min(x);
-        min_y = min_y.min(y);
-        max_x = max_x.max(x);
-        max_y = max_y.max(y);
+        let sx = shift.dx + x;
+        let sy = shift.dy + y;
+        min_x = min_x.min(sx);
+        min_y = min_y.min(sy);
+        max_x = max_x.max(sx);
+        max_y = max_y.max(sy);
     }
-    // We need every integer offset (ox, oy) such that the bbox + (ox, oy)
-    // overlaps [0, 1]. ox ∈ ⌈-max_x⌉..=⌊1-min_x⌋ etc.
-    let ox_lo = (-max_x).ceil() as i32;
-    let ox_hi = (1.0 - min_x).floor() as i32;
-    let oy_lo = (-max_y).ceil() as i32;
-    let oy_hi = (1.0 - min_y).floor() as i32;
-    // Clamp the tile loop to a sane range so a malformed polygon can't
-    // blow up the render loop.
+    // We need every integer offset (oi, oj) such that the bbox +
+    // (oi, oj) overlaps the canvas's visible (-0.5, 0.5] range.
+    let ox_lo = (-0.5 - max_x).ceil() as i32;
+    let ox_hi = (0.5 - min_x).floor() as i32;
+    let oy_lo = (-0.5 - max_y).ceil() as i32;
+    let oy_hi = (0.5 - min_y).floor() as i32;
     let ox_lo = ox_lo.max(-3);
     let ox_hi = ox_hi.min(3);
     let oy_lo = oy_lo.max(-3);
@@ -546,19 +567,24 @@ fn draw_face_tiled(
             let ox = oi as f32;
             let oy = oj as f32;
             for tri in &tris {
-                let v0 = vec2(
-                    origin.x + (tri[0].0 + ox) * size,
-                    origin.y + (tri[0].1 + oy) * size,
+                let v0 = rel_to_screen(
+                    shift.dx + tri[0].0 + ox,
+                    shift.dy + tri[0].1 + oy,
+                    canvas_origin,
+                    canvas_size,
                 );
-                let v1 = vec2(
-                    origin.x + (tri[1].0 + ox) * size,
-                    origin.y + (tri[1].1 + oy) * size,
+                let v1 = rel_to_screen(
+                    shift.dx + tri[1].0 + ox,
+                    shift.dy + tri[1].1 + oy,
+                    canvas_origin,
+                    canvas_size,
                 );
-                let v2 = vec2(
-                    origin.x + (tri[2].0 + ox) * size,
-                    origin.y + (tri[2].1 + oy) * size,
+                let v2 = rel_to_screen(
+                    shift.dx + tri[2].0 + ox,
+                    shift.dy + tri[2].1 + oy,
+                    canvas_origin,
+                    canvas_size,
                 );
-                // Rough triangle-vs-canvas reject.
                 let lo_x = v0.x.min(v1.x).min(v2.x);
                 let hi_x = v0.x.max(v1.x).max(v2.x);
                 let lo_y = v0.y.min(v1.y).min(v2.y);
