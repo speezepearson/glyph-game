@@ -95,12 +95,20 @@ impl TorusSegment {
         self.start.translate(self.disp)
     }
 
-    /// Iterate the 3×3 block of integer translates of this segment in
-    /// the universal cover, expressed in a frame anchored at
-    /// `anchor`. Each item is `((lift_offset_x, lift_offset_y),
-    /// ((start_x, start_y), (end_x, end_y)))` — the integer lift
-    /// indices for self-pair filtering, followed by the lifted
-    /// (start, end) pair in ℝ² with `anchor` at the origin.
+    /// Iterate the `(2r+1) × (2r+1)` block of integer translates of
+    /// this segment in the universal cover, in a frame anchored at
+    /// `anchor`. Each item is `((li, lj), ((start_x, start_y),
+    /// (end_x, end_y)))` — the integer lift indices for self-pair
+    /// filtering, followed by the lifted (start, end) pair in ℝ²
+    /// with `anchor` at the origin.
+    ///
+    /// Pick `r = 1` (3×3) for rendering & hit-testing of segments
+    /// with `|disp| < 0.5`. Pick `r = 2` (5×5) when looking for
+    /// segment-segment intersections among segments whose lifted
+    /// disps can reach ~1 per axis (e.g. chopped sub-edges with
+    /// winding ≠ 0). With `|disp| ≤ 1` per axis and signed_diff in
+    /// (-0.5, 0.5], an intersection can sit at any lift `|li|, |lj|
+    /// ≤ 2`, so 5×5 is the minimum.
     ///
     /// Translation-equivariant: shifting `self.start` and `anchor` by
     /// the same delta gives identical output, because the underlying
@@ -108,14 +116,15 @@ impl TorusSegment {
     pub fn lifts_anchored_at(
         self,
         anchor: TorusPoint,
+        radius: i32,
     ) -> impl Iterator<Item = ((i32, i32), ((f32, f32), (f32, f32)))> {
         let v = anchor.shortest_to(self.start);
         let ax = v.dx;
         let ay = v.dy;
         let bx = ax + self.disp.dx;
         let by = ay + self.disp.dy;
-        (-1..=1).flat_map(move |i| {
-            (-1..=1).map(move |j| {
+        (-radius..=radius).flat_map(move |i| {
+            (-radius..=radius).map(move |j| {
                 let ox = i as f32;
                 let oy = j as f32;
                 ((i, j), ((ax + ox, ay + oy), (bx + ox, by + oy)))
@@ -125,141 +134,128 @@ impl TorusSegment {
 }
 
 #[cfg(test)]
+impl quickcheck::Arbitrary for TorusPoint {
+    fn arbitrary(g: &mut quickcheck::Gen) -> Self {
+        TorusPoint {
+            x: crate::coord::Coord::arbitrary(g),
+            y: crate::coord::Coord::arbitrary(g),
+        }
+    }
+}
+
+#[cfg(test)]
+impl quickcheck::Arbitrary for TorusVec {
+    fn arbitrary(g: &mut quickcheck::Gen) -> Self {
+        // Bounded to roughly [-1, 1) per component, matching the
+        // realistic input range for a drawn segment (the canvas is 1
+        // unit on a side). The chop algorithm's 3×3 lift block only
+        // covers segments whose lifted disp stays within ~1 in each
+        // axis; longer disps wrap multiple times and would need a
+        // larger lift block, which we don't currently support.
+        let mk = |g: &mut quickcheck::Gen| (i16::arbitrary(g) as f32) / 32768.0;
+        TorusVec::new(mk(g), mk(g))
+    }
+}
+
+#[cfg(test)]
+impl quickcheck::Arbitrary for TorusSegment {
+    fn arbitrary(g: &mut quickcheck::Gen) -> Self {
+        TorusSegment {
+            start: TorusPoint::arbitrary(g),
+            disp: TorusVec::arbitrary(g),
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use quickcheck_macros::quickcheck;
 
-    struct Lcg(u64);
-    impl Lcg {
-        fn new(seed: u64) -> Self {
-            Self(seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1))
-        }
-        fn next_u32(&mut self) -> u32 {
-            self.0 = self
-                .0
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            (self.0 >> 32) as u32
-        }
-        fn next_f32(&mut self) -> f32 {
-            (self.next_u32() as f64 / u32::MAX as f64) as f32
-        }
-        fn next_signed_f32(&mut self) -> f32 {
-            self.next_f32() * 4.0 - 2.0
-        }
-        fn next_point(&mut self) -> TorusPoint {
-            TorusPoint::new(self.next_signed_f32(), self.next_signed_f32())
-        }
-        fn next_vec(&mut self) -> TorusVec {
-            TorusVec::new(self.next_signed_f32(), self.next_signed_f32())
-        }
-        fn next_segment(&mut self) -> TorusSegment {
-            TorusSegment {
-                start: self.next_point(),
-                disp: self.next_vec(),
-            }
-        }
-    }
-
-    // ---------- translation-invariance / equivariance ----------
+    // ---------- translation-invariance / equivariance properties ----------
     //
-    // Every public TorusPoint method has a fuzz test below verifying
-    // that uniform translation of all inputs leaves the output
-    // unchanged (for invariant ops) or shifted by the same amount
-    // (for equivariant ops). Tolerances are tight: most pass bit-equal.
+    // Every public TorusPoint method has a quickcheck property
+    // verifying that uniform translation of all inputs leaves the
+    // output unchanged (invariant ops) or shifted by the same delta
+    // (equivariant ops). Bit-equal for the integer-arithmetic-backed
+    // ops; 1e-6 tolerance for the few that round-trip an f32 sum.
 
-    /// `shortest_to` is exactly translation-invariant component-wise.
-    #[test]
-    fn fuzz_shortest_to_is_translation_invariant() {
-        let mut rng = Lcg::new(11);
-        for _ in 0..5000 {
-            let a = rng.next_point();
-            let b = rng.next_point();
-            let shift = rng.next_vec();
-            let v = a.shortest_to(b);
-            let vs = a.translate(shift).shortest_to(b.translate(shift));
-            assert_eq!(v.dx.to_bits(), vs.dx.to_bits());
-            assert_eq!(v.dy.to_bits(), vs.dy.to_bits());
-        }
+    /// `shortest_to` is bit-equal under uniform translation.
+    #[quickcheck]
+    fn prop_shortest_to_is_translation_invariant(
+        a: TorusPoint,
+        b: TorusPoint,
+        shift: TorusVec,
+    ) -> bool {
+        let v = a.shortest_to(b);
+        let vs = a.translate(shift).shortest_to(b.translate(shift));
+        v.dx.to_bits() == vs.dx.to_bits() && v.dy.to_bits() == vs.dy.to_bits()
     }
 
-    /// `distance_to` is exactly translation-invariant.
-    #[test]
-    fn fuzz_distance_to_is_translation_invariant() {
-        let mut rng = Lcg::new(12);
-        for _ in 0..5000 {
-            let a = rng.next_point();
-            let b = rng.next_point();
-            let shift = rng.next_vec();
-            assert_eq!(
-                a.distance_to(b).to_bits(),
-                a.translate(shift).distance_to(b.translate(shift)).to_bits()
-            );
-        }
+    /// `distance_to` is bit-equal under uniform translation.
+    #[quickcheck]
+    fn prop_distance_to_is_translation_invariant(
+        a: TorusPoint,
+        b: TorusPoint,
+        shift: TorusVec,
+    ) -> bool {
+        a.distance_to(b).to_bits()
+            == a.translate(shift).distance_to(b.translate(shift)).to_bits()
     }
 
-    /// `translate` is equivariant: translating, then shifting, equals
-    /// shifting, then translating.
-    #[test]
-    fn fuzz_translate_is_equivariant() {
-        let mut rng = Lcg::new(13);
-        for _ in 0..5000 {
-            let p = rng.next_point();
-            let v = rng.next_vec();
-            let shift = rng.next_vec();
-            // (p.translate(v)).translate(shift) ≡ (p.translate(shift)).translate(v)
-            let lhs = p.translate(v).translate(shift);
-            let rhs = p.translate(shift).translate(v);
-            // Tolerance because shifted compositions can differ by 1
-            // ULP in f32. Bound the disagreement in Coord units.
-            assert!(lhs.distance_to(rhs) < 1e-6);
-        }
+    /// `translate` is equivariant: translation order doesn't matter.
+    /// Composed f32 shifts can differ by 1 ULP, so we bound by torus
+    /// distance rather than expecting bit-equality.
+    #[quickcheck]
+    fn prop_translate_is_equivariant(p: TorusPoint, v: TorusVec, shift: TorusVec) -> bool {
+        let lhs = p.translate(v).translate(shift);
+        let rhs = p.translate(shift).translate(v);
+        lhs.distance_to(rhs) < 1e-6
     }
 
     /// `TorusSegment::end` is equivariant: shifting the start shifts
     /// the end by the same delta.
-    #[test]
-    fn fuzz_segment_end_is_equivariant() {
-        let mut rng = Lcg::new(14);
-        for _ in 0..5000 {
-            let s = rng.next_segment();
-            let shift = rng.next_vec();
-            let lhs = s.end().translate(shift);
-            let rhs = TorusSegment {
-                start: s.start.translate(shift),
-                disp: s.disp,
-            }
-            .end();
-            assert!(lhs.distance_to(rhs) < 1e-6);
+    #[quickcheck]
+    fn prop_segment_end_is_equivariant(s: TorusSegment, shift: TorusVec) -> bool {
+        let lhs = s.end().translate(shift);
+        let rhs = TorusSegment {
+            start: s.start.translate(shift),
+            disp: s.disp,
         }
+        .end();
+        lhs.distance_to(rhs) < 1e-6
     }
 
-    /// `TorusSegment::lifts_anchored_at` is exactly translation-
-    /// invariant: shifting `self.start` AND `anchor` by the same
-    /// delta gives bit-equal output.
-    #[test]
-    fn fuzz_segment_lifts_are_translation_invariant() {
-        let mut rng = Lcg::new(15);
-        for _ in 0..2000 {
-            let s = rng.next_segment();
-            let anchor = rng.next_point();
-            let shift = rng.next_vec();
-            let s_shifted = TorusSegment {
-                start: s.start.translate(shift),
-                disp: s.disp,
-            };
-            let anchor_shifted = anchor.translate(shift);
-            let lifts_a: Vec<_> = s.lifts_anchored_at(anchor).collect();
-            let lifts_b: Vec<_> = s_shifted.lifts_anchored_at(anchor_shifted).collect();
-            assert_eq!(lifts_a.len(), lifts_b.len());
-            for (((_, ((a_sx, a_sy), (a_ex, a_ey))), (_, ((b_sx, b_sy), (b_ex, b_ey)))))
-                in lifts_a.iter().zip(lifts_b.iter())
+    /// `TorusSegment::lifts_anchored_at` is bit-equal under uniform
+    /// translation of both `self.start` and `anchor`.
+    #[quickcheck]
+    fn prop_segment_lifts_are_translation_invariant(
+        s: TorusSegment,
+        anchor: TorusPoint,
+        shift: TorusVec,
+    ) -> bool {
+        let s_shifted = TorusSegment {
+            start: s.start.translate(shift),
+            disp: s.disp,
+        };
+        let anchor_shifted = anchor.translate(shift);
+        let lifts_a: Vec<_> = s.lifts_anchored_at(anchor, 2).collect();
+        let lifts_b: Vec<_> = s_shifted.lifts_anchored_at(anchor_shifted, 2).collect();
+        if lifts_a.len() != lifts_b.len() {
+            return false;
+        }
+        for ((_, ((a_sx, a_sy), (a_ex, a_ey))), (_, ((b_sx, b_sy), (b_ex, b_ey))))
+            in lifts_a.iter().zip(lifts_b.iter())
+        {
+            if a_sx.to_bits() != b_sx.to_bits()
+                || a_sy.to_bits() != b_sy.to_bits()
+                || a_ex.to_bits() != b_ex.to_bits()
+                || a_ey.to_bits() != b_ey.to_bits()
             {
-                assert_eq!(a_sx.to_bits(), b_sx.to_bits());
-                assert_eq!(a_sy.to_bits(), b_sy.to_bits());
-                assert_eq!(a_ex.to_bits(), b_ex.to_bits());
-                assert_eq!(a_ey.to_bits(), b_ey.to_bits());
+                return false;
             }
         }
+        true
     }
 
     // ---------- spot checks ----------

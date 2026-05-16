@@ -221,7 +221,7 @@ fn segments_touch(seg_a: &TorusSegment, seg_b: &TorusSegment) -> bool {
     // 9 lifts are produced relative to the same anchor.
     let a0 = (0.0, 0.0);
     let a1 = (seg_a.disp.dx, seg_a.disp.dy);
-    for (_, (b0, b1)) in seg_b.lifts_anchored_at(seg_a.start) {
+    for (_, (b0, b1)) in seg_b.lifts_anchored_at(seg_a.start, 2) {
         if seg_seg_intersect(a0, a1, b0, b1).is_some() {
             return true;
         }
@@ -264,7 +264,7 @@ fn chop(vertices: &mut Vec<TorusPoint>, edges: &mut Vec<Edge>) {
                     TorusVec::new(jx, jy)
                 },
             };
-            for ((li, lj), (b0, b1)) in seg_j.lifts_anchored_at(u_i) {
+            for ((li, lj), (b0, b1)) in seg_j.lifts_anchored_at(u_i, 2) {
                 if i == j && li == 0 && lj == 0 {
                     continue;
                 }
@@ -302,8 +302,11 @@ fn chop(vertices: &mut Vec<TorusPoint>, edges: &mut Vec<Edge>) {
                 continue;
             }
             let v_rel = u_i.shortest_to(vertices[vid as usize]);
-            for li in -1..=1 {
-                for lj in -1..=1 {
+            // ±2 to match the chop pairwise loop; for chopped sub-
+            // edges with non-zero winding the lifted disp can reach
+            // ~1.5 per axis.
+            for li in -2..=2 {
+                for lj in -2..=2 {
                     let vx = v_rel.dx + li as f32;
                     let vy = v_rel.dy + lj as f32;
                     let t = (vx * di_x + vy * di_y) / len2;
@@ -849,6 +852,8 @@ fn compute_topological_face_count(vertices: &[TorusPoint], edges: &[Edge]) -> us
 #[cfg(test)]
 mod tests {
     use super::*;
+    use quickcheck::Arbitrary;
+    use quickcheck_macros::quickcheck;
 
     fn seg(ax: f32, ay: f32, bx: f32, by: f32) -> TorusSegment {
         let start = TorusPoint::new(ax, ay);
@@ -948,6 +953,44 @@ mod tests {
     }
 
     #[test]
+    fn quickcheck_repro_two_segments() {
+        // Counterexample found by quickcheck.
+        let seg1 = TorusSegment {
+            start: TorusPoint {
+                x: crate::coord::Coord::from_f32(2258791650.0 / 4_294_967_296.0),
+                y: crate::coord::Coord::from_f32(3742000625.0 / 4_294_967_296.0),
+            },
+            disp: TorusVec::new(-0.6873474, 0.8645935),
+        };
+        let seg2 = TorusSegment {
+            start: TorusPoint {
+                x: crate::coord::Coord::from_f32(255264678.0 / 4_294_967_296.0),
+                y: crate::coord::Coord::from_f32(1818387102.0 / 4_294_967_296.0),
+            },
+            disp: TorusVec::new(0.9850769, -0.91452026),
+        };
+        let mut glyphs: Vec<Glyph> = Vec::new();
+        add_segment(&mut glyphs, seg1);
+        add_segment(&mut glyphs, seg2);
+        for (gi, g) in glyphs.iter().enumerate() {
+            println!("glyph {gi}: V={} E={}", g.vertices.len(), g.edges.len());
+            for (vi, v) in g.vertices.iter().enumerate() {
+                let dx = TorusPoint::new(0.0, 0.0).x.signed_diff_to(v.x);
+                let dy = TorusPoint::new(0.0, 0.0).y.signed_diff_to(v.y);
+                println!("  v{vi}: relative to (0,0) → ({:.4}, {:.4})", dx, dy);
+            }
+            for (ei, e) in g.edges.iter().enumerate() {
+                let s = g.edge_segment(ei);
+                println!("  edge {ei}: v{}→v{} winding={:?} disp=({:.4}, {:.4})", e.u, e.v, e.winding, s.disp.dx, s.disp.dy);
+            }
+            let result = check_no_interior_crossings(g);
+            println!("  invariant 1: {:?}", result);
+            result.expect("invariant 1");
+            check_connected(g).expect("invariant 2");
+        }
+    }
+
+    #[test]
     fn focused_t_junction() {
         let seg_a = TorusSegment {
             start: TorusPoint::new(0.59636897, 0.18071648),
@@ -962,33 +1005,37 @@ mod tests {
         check_no_interior_crossings(&g).unwrap();
     }
 
-    // ---------- fuzz tests ----------
+    // ---------- quickcheck properties ----------
 
-    struct Lcg(u64);
-    impl Lcg {
-        fn new(seed: u64) -> Self {
-            Self(seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1))
-        }
-        fn next_u32(&mut self) -> u32 {
-            self.0 = self
-                .0
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            (self.0 >> 32) as u32
-        }
-        fn next_f32(&mut self) -> f32 {
-            (self.next_u32() as f64 / u32::MAX as f64) as f32
-        }
+    /// One operation in a fuzz sequence: either add a fresh segment,
+    /// or remove an edge by uniform-random index into the total edge
+    /// list. The `Remove` index is taken mod the live edge count so
+    /// it always picks a valid edge (no-op if there are no edges).
+    #[derive(Clone, Debug)]
+    enum FuzzOp {
+        Add(TorusSegment),
+        Remove(usize),
     }
 
-    fn random_segment(rng: &mut Lcg) -> TorusSegment {
-        let sx = rng.next_f32();
-        let sy = rng.next_f32();
-        let dx = rng.next_f32() - 0.5;
-        let dy = rng.next_f32() - 0.5;
-        TorusSegment {
-            start: TorusPoint::new(sx, sy),
-            disp: TorusVec::new(dx, dy),
+    impl Arbitrary for FuzzOp {
+        fn arbitrary(g: &mut quickcheck::Gen) -> Self {
+            // Roughly 70% adds, 30% removes — matches the workload we
+            // had under the old hand-rolled LCG fuzz.
+            if u8::arbitrary(g) < 180 {
+                FuzzOp::Add(TorusSegment::arbitrary(g))
+            } else {
+                FuzzOp::Remove(usize::arbitrary(g))
+            }
+        }
+        fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+            // Only `Remove` shrinks meaningfully (toward smaller
+            // indices). TorusSegment has no shrink, so `Add` is a
+            // leaf for shrinking purposes; quickcheck will still
+            // shrink the surrounding Vec.
+            match *self {
+                FuzzOp::Add(_) => quickcheck::empty_shrinker(),
+                FuzzOp::Remove(i) => Box::new(i.shrink().map(FuzzOp::Remove)),
+            }
         }
     }
 
@@ -1003,7 +1050,7 @@ mod tests {
                 // frame.
                 let a0 = (0.0, 0.0);
                 let a1 = (a.disp.dx, a.disp.dy);
-                for (_, (b0, b1)) in b.lifts_anchored_at(a.start) {
+                for (_, (b0, b1)) in b.lifts_anchored_at(a.start, 2) {
                     let Some((_ta, _tb, px, py)) = seg_seg_intersect(a0, a1, b0, b1) else {
                         continue;
                     };
@@ -1058,107 +1105,89 @@ mod tests {
         Ok(())
     }
 
-    fn run_fuzz(seed: u64, iterations: usize) {
-        let mut rng = Lcg::new(seed);
-        let mut glyphs: Vec<Glyph> = Vec::new();
-        for iter in 0..iterations {
-            let action = rng.next_u32() % 100;
-            let total_edges: usize = glyphs.iter().map(|g| g.edges.len()).sum();
-            if action < 70 || total_edges == 0 {
-                add_segment(&mut glyphs, random_segment(&mut rng));
-            } else {
-                let target = (rng.next_u32() as usize) % total_edges;
+    /// Apply one fuzz op to a world of glyphs. `Remove` indices are
+    /// taken mod the live edge count so they're always valid; with no
+    /// live edges, it's a no-op.
+    fn apply(glyphs: &mut Vec<Glyph>, op: &FuzzOp) {
+        match op {
+            FuzzOp::Add(s) => add_segment(glyphs, *s),
+            FuzzOp::Remove(i) => {
+                let total: usize = glyphs.iter().map(|g| g.edges.len()).sum();
+                if total == 0 {
+                    return;
+                }
+                let target = i % total;
                 let mut acc = 0;
-                let mut found = None;
-                for (gi, g) in glyphs.iter().enumerate() {
-                    if acc + g.edges.len() > target {
-                        found = Some((gi, target - acc));
-                        break;
+                for gi in 0..glyphs.len() {
+                    if acc + glyphs[gi].edges.len() > target {
+                        remove_edge(glyphs, gi, target - acc);
+                        return;
                     }
-                    acc += g.edges.len();
-                }
-                let (gi, ei) = found.expect("uniform pick must land somewhere");
-                remove_edge(&mut glyphs, gi, ei);
-            }
-            for (idx, g) in glyphs.iter().enumerate() {
-                if let Err(e) = check_no_interior_crossings(g) {
-                    panic!("seed {seed}, iter {iter}, glyph {idx}: invariant 1: {e}");
-                }
-                if let Err(e) = check_connected(g) {
-                    panic!("seed {seed}, iter {iter}, glyph {idx}: invariant 2: {e}");
+                    acc += glyphs[gi].edges.len();
                 }
             }
         }
     }
 
-    #[test]
-    fn fuzz_invariants_seed_0() {
-        run_fuzz(0, 120);
-    }
-
-    #[test]
-    fn fuzz_invariants_seed_1() {
-        run_fuzz(1, 120);
-    }
-
-    #[test]
-    fn fuzz_invariants_seed_2() {
-        run_fuzz(2, 120);
+    /// After every operation in any add/remove sequence, every glyph
+    /// must satisfy both invariants: no two edges share an interior
+    /// point, and every vertex is reachable from every other.
+    /// Returns the failing diagnostic via Result so quickcheck's
+    /// shrunk counterexample prints the actual invariant violation.
+    #[quickcheck]
+    fn prop_invariants_hold_after_every_op(ops: Vec<FuzzOp>) -> Result<(), String> {
+        let mut glyphs: Vec<Glyph> = Vec::new();
+        for (idx, op) in ops.iter().enumerate() {
+            apply(&mut glyphs, op);
+            for (gi, g) in glyphs.iter().enumerate() {
+                check_no_interior_crossings(g)
+                    .map_err(|e| format!("after op {idx} glyph {gi}: invariant 1: {e}"))?;
+                check_connected(g)
+                    .map_err(|e| format!("after op {idx} glyph {gi}: invariant 2: {e}"))?;
+            }
+        }
+        Ok(())
     }
 
     /// Building the same sequence of segments — once as-is and once
     /// with every input shifted by a uniform delta — produces glyphs
-    /// with the same structure. The Coord type's translation
-    /// invariance, plus the lifted_disp = signed_diff_to + winding
-    /// convention, are supposed to make this hold across glyph
-    /// operations even when the shift drags vertices across the 0/1
-    /// boundary.
-    #[test]
-    fn fuzz_glyph_structure_translation_invariant() {
-        let mut rng = Lcg::new(99);
-        for trial in 0..20 {
-            let shift = TorusVec::new(rng.next_f32() * 4.0 - 2.0, rng.next_f32() * 4.0 - 2.0);
-            let segs: Vec<TorusSegment> = (0..10).map(|_| random_segment(&mut rng)).collect();
-            let mut glyphs_a: Vec<Glyph> = Vec::new();
-            let mut glyphs_b: Vec<Glyph> = Vec::new();
-            for s in &segs {
-                add_segment(&mut glyphs_a, *s);
-                add_segment(
-                    &mut glyphs_b,
-                    TorusSegment {
-                        start: s.start.translate(shift),
-                        disp: s.disp,
-                    },
-                );
-            }
-            assert_eq!(
-                glyphs_a.len(),
-                glyphs_b.len(),
-                "trial {trial} (shift={:?}): glyph count differs",
-                shift
+    /// with the same combinatorial structure. The whole Coord-based
+    /// translation-invariance program is supposed to make this hold
+    /// across glyph operations even when the shift drags vertices
+    /// across the canvas seam.
+    ///
+    /// Topological face count is excluded because it comes from
+    /// rasterization on a fixed grid and is only approximately
+    /// translation-invariant (cell-quantization can merge or split
+    /// nearby segments depending on alignment).
+    #[quickcheck]
+    fn prop_glyph_structure_is_translation_invariant(
+        segs: Vec<TorusSegment>,
+        shift: TorusVec,
+    ) -> bool {
+        let mut glyphs_a: Vec<Glyph> = Vec::new();
+        let mut glyphs_b: Vec<Glyph> = Vec::new();
+        for s in &segs {
+            add_segment(&mut glyphs_a, *s);
+            add_segment(
+                &mut glyphs_b,
+                TorusSegment {
+                    start: s.start.translate(shift),
+                    disp: s.disp,
+                },
             );
-            for (gi, (ga, gb)) in glyphs_a.iter().zip(glyphs_b.iter()).enumerate() {
-                assert_eq!(
-                    ga.vertices.len(),
-                    gb.vertices.len(),
-                    "trial {trial} glyph {gi}: V"
-                );
-                assert_eq!(
-                    ga.edges.len(),
-                    gb.edges.len(),
-                    "trial {trial} glyph {gi}: E"
-                );
-                assert_eq!(
-                    ga.faces.len(),
-                    gb.faces.len(),
-                    "trial {trial} glyph {gi}: F (combinatorial)"
-                );
-                // topological_face_count comes from rasterization on
-                // a fixed grid and is fundamentally only approximately
-                // translation-invariant (cell-quantization can merge
-                // or split nearby segments depending on alignment).
-                // Don't assert on it here.
+        }
+        if glyphs_a.len() != glyphs_b.len() {
+            return false;
+        }
+        for (ga, gb) in glyphs_a.iter().zip(glyphs_b.iter()) {
+            if ga.vertices.len() != gb.vertices.len()
+                || ga.edges.len() != gb.edges.len()
+                || ga.faces.len() != gb.faces.len()
+            {
+                return false;
             }
         }
+        true
     }
 }

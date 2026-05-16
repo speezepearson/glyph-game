@@ -360,7 +360,7 @@ fn pick_edge_in_glyphs(glyphs: &[Glyph], p: TorusPoint) -> Option<(usize, usize)
 /// and we iterate the segment's 9 lifts in that frame.
 fn distance_point_to_segment(seg: &TorusSegment, p: TorusPoint) -> f32 {
     let mut best = f32::INFINITY;
-    for (_, ((ax, ay), (bx, by))) in seg.lifts_anchored_at(p) {
+    for (_, ((ax, ay), (bx, by))) in seg.lifts_anchored_at(p, 2) {
         let d = dist_point_to_seg_2d(0.0, 0.0, ax, ay, bx, by);
         if d < best {
             best = d;
@@ -481,7 +481,7 @@ fn draw_segment_tiled(
     rect_min: Vec2,
     rect_max: Vec2,
 ) {
-    for (_, ((ax, ay), (bx, by))) in seg.lifts_anchored_at(anchor) {
+    for (_, ((ax, ay), (bx, by))) in seg.lifts_anchored_at(anchor, 2) {
         let pa = rel_to_screen(ax, ay, canvas_origin, canvas_size);
         let pb = rel_to_screen(bx, by, canvas_origin, canvas_size);
         if let Some((c0, c1)) = clip_line_to_rect(pa, pb, rect_min, rect_max) {

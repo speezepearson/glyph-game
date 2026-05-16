@@ -51,64 +51,56 @@ impl Coord {
 }
 
 #[cfg(test)]
+impl quickcheck::Arbitrary for Coord {
+    fn arbitrary(g: &mut quickcheck::Gen) -> Self {
+        // Uniform over the full torus axis — u32::arbitrary covers
+        // the whole circle.
+        Self {
+            u: u32::arbitrary(g),
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use quickcheck::Arbitrary;
+    use quickcheck_macros::quickcheck;
 
-    struct Lcg(u64);
-    impl Lcg {
-        fn new(seed: u64) -> Self {
-            Self(seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1))
+    /// Bounded-range f32 wrapper for shift deltas, so quickcheck
+    /// produces interesting shifts (~ [-2, 2)) and shrinks toward 0.
+    #[derive(Copy, Clone, Debug)]
+    struct ShiftDelta(f32);
+    impl Arbitrary for ShiftDelta {
+        fn arbitrary(g: &mut quickcheck::Gen) -> Self {
+            ShiftDelta((i16::arbitrary(g) as f32) / 16384.0)
         }
-        fn next_u32(&mut self) -> u32 {
-            self.0 = self
-                .0
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            (self.0 >> 32) as u32
-        }
-        fn next_f32(&mut self) -> f32 {
-            (self.next_u32() as f64 / u32::MAX as f64) as f32
-        }
-        fn next_signed_f32(&mut self) -> f32 {
-            self.next_f32() * 4.0 - 2.0
+        fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+            let i = (self.0 * 16384.0) as i16;
+            Box::new(i.shrink().map(|i| ShiftDelta((i as f32) / 16384.0)))
         }
     }
 
-    /// signed_diff_to is exactly invariant under uniform translation:
-    /// shifting both Coords by the same delta gives the exact same
-    /// f32 answer, bit-equal, no tolerance.
-    #[test]
-    fn fuzz_signed_diff_is_exactly_translation_invariant() {
-        let mut rng = Lcg::new(1);
-        for _ in 0..5000 {
-            let a = Coord::from_f32(rng.next_signed_f32());
-            let b = Coord::from_f32(rng.next_signed_f32());
-            let shift = rng.next_signed_f32();
-            assert_eq!(
-                a.signed_diff_to(b).to_bits(),
-                a.shifted(shift).signed_diff_to(b.shifted(shift)).to_bits(),
-                "shift={shift}",
-            );
-        }
+    /// `signed_diff_to` is bit-equal under uniform translation of both
+    /// inputs.
+    #[quickcheck]
+    fn prop_signed_diff_is_translation_invariant(
+        a: Coord,
+        b: Coord,
+        shift: ShiftDelta,
+    ) -> bool {
+        let s = shift.0;
+        a.signed_diff_to(b).to_bits()
+            == a.shifted(s).signed_diff_to(b.shifted(s)).to_bits()
     }
 
-    /// `shifted` composes additively, modulo u32 wrap. Quick sanity.
-    #[test]
-    fn fuzz_shift_composes() {
-        let mut rng = Lcg::new(2);
-        for _ in 0..5000 {
-            let c = Coord::from_f32(rng.next_signed_f32());
-            let a = rng.next_signed_f32();
-            let b = rng.next_signed_f32();
-            // c.shifted(a).shifted(b) ≡ c.shifted(a + b) (modulo wrap),
-            // so the diff from one to the other is 0.
-            let lhs = c.shifted(a).shifted(b);
-            let rhs = c.shifted(a + b);
-            // Tolerance because (a + b) computed in f32 vs sequential
-            // shift differ by 1 ULP at the boundary. Both should round
-            // to within a handful of u32 units.
-            let diff = lhs.signed_diff_to(rhs).abs();
-            assert!(diff < 1e-6, "diff={diff} a={a} b={b}");
-        }
+    /// Sequential shifts add: `c.shifted(a).shifted(b)` agrees with
+    /// `c.shifted(a + b)` modulo the u32 grid resolution (~1e-9 in
+    /// f32 distance terms; tolerance bumped for f32 sum noise).
+    #[quickcheck]
+    fn prop_shift_composes(c: Coord, a: ShiftDelta, b: ShiftDelta) -> bool {
+        let lhs = c.shifted(a.0).shifted(b.0);
+        let rhs = c.shifted(a.0 + b.0);
+        lhs.signed_diff_to(rhs).abs() < 1e-6
     }
 }

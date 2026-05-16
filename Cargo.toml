@@ -6,6 +6,10 @@ edition = "2021"
 [dependencies]
 macroquad = "0.4"
 
+[dev-dependencies]
+quickcheck = "1"
+quickcheck_macros = "1"
+
 [profile.release]
 opt-level = 3
 lto = true
