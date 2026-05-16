@@ -59,6 +59,12 @@ impl quickcheck::Arbitrary for Coord {
             u: u32::arbitrary(g),
         }
     }
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+        // Shrinks toward 0 (canonical Coord::from_f32(0.0)). Lets
+        // quickcheck simplify a failing Coord rather than leaving the
+        // original opaque u32 in the counterexample.
+        Box::new(self.u.shrink().map(|u| Self { u }))
+    }
 }
 
 #[cfg(test)]

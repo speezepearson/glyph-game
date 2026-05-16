@@ -141,6 +141,13 @@ impl quickcheck::Arbitrary for TorusPoint {
             y: crate::coord::Coord::arbitrary(g),
         }
     }
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+        Box::new(
+            (self.x, self.y)
+                .shrink()
+                .map(|(x, y)| TorusPoint { x, y }),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -148,12 +155,24 @@ impl quickcheck::Arbitrary for TorusVec {
     fn arbitrary(g: &mut quickcheck::Gen) -> Self {
         // Bounded to roughly [-1, 1) per component, matching the
         // realistic input range for a drawn segment (the canvas is 1
-        // unit on a side). The chop algorithm's 3×3 lift block only
-        // covers segments whose lifted disp stays within ~1 in each
-        // axis; longer disps wrap multiple times and would need a
-        // larger lift block, which we don't currently support.
+        // unit on a side). The chop algorithm's 5×5 lift block covers
+        // segments whose lifted disp stays within ~1 in each axis.
         let mk = |g: &mut quickcheck::Gen| (i16::arbitrary(g) as f32) / 32768.0;
         TorusVec::new(mk(g), mk(g))
+    }
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+        // Shrink each axis by round-tripping through i16 (matching
+        // Arbitrary's representation). Shrinks toward (0, 0), which
+        // is a degenerate zero-length disp — quickcheck's per-test
+        // skips don't filter those out at the type level, but our
+        // chop's `disp²<EPS²` check does.
+        let to_i16 = |f: f32| (f * 32768.0).clamp(-32768.0, 32767.0) as i16;
+        let from_i16 = |i: i16| (i as f32) / 32768.0;
+        Box::new(
+            (to_i16(self.dx), to_i16(self.dy))
+                .shrink()
+                .map(move |(dx, dy)| TorusVec::new(from_i16(dx), from_i16(dy))),
+        )
     }
 }
 
@@ -164,6 +183,13 @@ impl quickcheck::Arbitrary for TorusSegment {
             start: TorusPoint::arbitrary(g),
             disp: TorusVec::arbitrary(g),
         }
+    }
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+        Box::new(
+            (self.start, self.disp)
+                .shrink()
+                .map(|(start, disp)| TorusSegment { start, disp }),
+        )
     }
 }
 

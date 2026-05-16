@@ -1028,12 +1028,11 @@ mod tests {
             }
         }
         fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
-            // Only `Remove` shrinks meaningfully (toward smaller
-            // indices). TorusSegment has no shrink, so `Add` is a
-            // leaf for shrinking purposes; quickcheck will still
-            // shrink the surrounding Vec.
+            // Shrink each variant by shrinking its payload. With
+            // TorusSegment now shrinkable (via Coord and TorusVec),
+            // the reported counterexample's geometry simplifies too.
             match *self {
-                FuzzOp::Add(_) => quickcheck::empty_shrinker(),
+                FuzzOp::Add(s) => Box::new(s.shrink().map(FuzzOp::Add)),
                 FuzzOp::Remove(i) => Box::new(i.shrink().map(FuzzOp::Remove)),
             }
         }
@@ -1130,64 +1129,67 @@ mod tests {
     }
 
     /// After every operation in any add/remove sequence, every glyph
-    /// must satisfy both invariants: no two edges share an interior
-    /// point, and every vertex is reachable from every other.
-    /// Returns the failing diagnostic via Result so quickcheck's
-    /// shrunk counterexample prints the actual invariant violation.
-    #[quickcheck]
-    fn prop_invariants_hold_after_every_op(ops: Vec<FuzzOp>) -> Result<(), String> {
-        let mut glyphs: Vec<Glyph> = Vec::new();
-        for (idx, op) in ops.iter().enumerate() {
-            apply(&mut glyphs, op);
-            for (gi, g) in glyphs.iter().enumerate() {
-                check_no_interior_crossings(g)
-                    .map_err(|e| format!("after op {idx} glyph {gi}: invariant 1: {e}"))?;
-                check_connected(g)
-                    .map_err(|e| format!("after op {idx} glyph {gi}: invariant 2: {e}"))?;
+    /// must satisfy both invariants. Manually invoked with a smaller
+    /// `Gen::size()` than quickcheck's default 100; with chop being
+    /// O(N²) and check being O(N²), shrinking is O(N⁴) and quickly
+    /// becomes minutes long at the default size, while bugs surface
+    /// at much smaller N.
+    #[test]
+    fn prop_invariants_hold_after_every_op() {
+        fn prop(ops: Vec<FuzzOp>) -> Result<(), String> {
+            let mut glyphs: Vec<Glyph> = Vec::new();
+            for (idx, op) in ops.iter().enumerate() {
+                apply(&mut glyphs, op);
+                for (gi, g) in glyphs.iter().enumerate() {
+                    check_no_interior_crossings(g)
+                        .map_err(|e| format!("after op {idx} glyph {gi}: invariant 1: {e}"))?;
+                    check_connected(g)
+                        .map_err(|e| format!("after op {idx} glyph {gi}: invariant 2: {e}"))?;
+                }
             }
+            Ok(())
         }
-        Ok(())
+        quickcheck::QuickCheck::new()
+            .gen(quickcheck::Gen::new(20))
+            .tests(200)
+            .quickcheck(prop as fn(Vec<FuzzOp>) -> Result<(), String>);
     }
 
     /// Building the same sequence of segments — once as-is and once
     /// with every input shifted by a uniform delta — produces glyphs
-    /// with the same combinatorial structure. The whole Coord-based
-    /// translation-invariance program is supposed to make this hold
-    /// across glyph operations even when the shift drags vertices
-    /// across the canvas seam.
-    ///
-    /// Topological face count is excluded because it comes from
-    /// rasterization on a fixed grid and is only approximately
-    /// translation-invariant (cell-quantization can merge or split
-    /// nearby segments depending on alignment).
-    #[quickcheck]
-    fn prop_glyph_structure_is_translation_invariant(
-        segs: Vec<TorusSegment>,
-        shift: TorusVec,
-    ) -> bool {
-        let mut glyphs_a: Vec<Glyph> = Vec::new();
-        let mut glyphs_b: Vec<Glyph> = Vec::new();
-        for s in &segs {
-            add_segment(&mut glyphs_a, *s);
-            add_segment(
-                &mut glyphs_b,
-                TorusSegment {
-                    start: s.start.translate(shift),
-                    disp: s.disp,
-                },
-            );
-        }
-        if glyphs_a.len() != glyphs_b.len() {
-            return false;
-        }
-        for (ga, gb) in glyphs_a.iter().zip(glyphs_b.iter()) {
-            if ga.vertices.len() != gb.vertices.len()
-                || ga.edges.len() != gb.edges.len()
-                || ga.faces.len() != gb.faces.len()
-            {
+    /// with the same combinatorial structure. Same Gen-size argument
+    /// as the invariant prop above.
+    #[test]
+    fn prop_glyph_structure_is_translation_invariant() {
+        fn prop(segs: Vec<TorusSegment>, shift: TorusVec) -> bool {
+            let mut glyphs_a: Vec<Glyph> = Vec::new();
+            let mut glyphs_b: Vec<Glyph> = Vec::new();
+            for s in &segs {
+                add_segment(&mut glyphs_a, *s);
+                add_segment(
+                    &mut glyphs_b,
+                    TorusSegment {
+                        start: s.start.translate(shift),
+                        disp: s.disp,
+                    },
+                );
+            }
+            if glyphs_a.len() != glyphs_b.len() {
                 return false;
             }
+            for (ga, gb) in glyphs_a.iter().zip(glyphs_b.iter()) {
+                if ga.vertices.len() != gb.vertices.len()
+                    || ga.edges.len() != gb.edges.len()
+                    || ga.faces.len() != gb.faces.len()
+                {
+                    return false;
+                }
+            }
+            true
         }
-        true
+        quickcheck::QuickCheck::new()
+            .gen(quickcheck::Gen::new(20))
+            .tests(200)
+            .quickcheck(prop as fn(Vec<TorusSegment>, TorusVec) -> bool);
     }
 }
